@@ -1,0 +1,56 @@
+#!/bin/sh
+#
+# commit-msg hook: strip AI-assistant attribution from commit messages.
+#
+# Removes trailers and banners that coding assistants (Claude Code, Cursor,
+# Copilot, Codex, Aider, Devin, Windsurf, ...) append automatically, then
+# tidies up the blank lines left behind.
+#
+# Human co-authors are preserved: only Co-authored-by lines naming a known
+# assistant or its vendor are removed.
+#
+# Install with githooks/install.sh (see that script for details).
+
+set -e
+
+MSG_FILE="$1"
+[ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ] || exit 0
+
+# Assistant names / vendors used to identify machine attribution.
+# Whole words only: "Cody" and "Devin" are also people's names, and a human
+# co-author whose name contains one of these must survive.
+NAMES='claude|anthropic|cursor|copilot|codex|aider|devin|windsurf|sourcegraph|cody|tabnine|codeium|chatgpt|openai|gemini|google-labs-jules'
+AGENTS="\\b($NAMES)\\b"
+AGENTS_LEAD="\\b($NAMES)" # no trailing boundary: "cursor_session:" is one word
+
+WORK="$MSG_FILE.hook.$$"
+trap 'rm -f "$WORK" "$WORK.tmp"' EXIT
+
+# 1. Drop machine-attribution lines:
+#    - attribution trailers naming an assistant
+#    - "Generated with <assistant>" banners (with or without a leading emoji)
+#    - session / conversation id trailers
+#    - a lone robot-emoji line left behind by some tools
+grep -v -i -E \
+  -e "^[[:space:]]*(co-authored-by|signed-off-by|assisted-by|authored-by|created-by|generated-by)[[:space:]]*:.*$AGENTS" \
+  -e "^[[:space:]]*(.{0,4}[[:space:]]*)?(generated|co-authored|written|created|assisted)[[:space:]]+(with|by)[[:space:]]+\[?$AGENTS" \
+  -e "^[[:space:]]*$AGENTS_LEAD[-_ ]?(code[-_ ]?)?(session|conversation|thread|chat|request|trace)[-_ ]?(id|url|link)?[[:space:]]*:" \
+  -e "^[[:space:]]*(session|conversation)[-_ ]?id[[:space:]]*:.*$AGENTS" \
+  -e "^[[:space:]]*🤖[[:space:]]*$" \
+  "$MSG_FILE" > "$WORK" || true
+
+# 2. Collapse runs of blank lines into one, and drop blank lines that now sit
+#    at the very end of the message (before git's trailing comment block).
+awk '
+  /^#/             { pending = 0; print; next }
+  /^[[:space:]]*$/ { if (started) pending = 1; next }
+                   { if (pending) print ""; pending = 0; started = 1; print }
+' "$WORK" > "$WORK.tmp" && mv "$WORK.tmp" "$WORK"
+
+# 3. Keep the result only if a non-comment, non-blank line survives, so a
+#    message that was *only* attribution does not silently become empty.
+if grep -q -E '^[[:space:]]*[^[:space:]#]' "$WORK"; then
+  cp "$WORK" "$MSG_FILE"
+fi
+
+exit 0

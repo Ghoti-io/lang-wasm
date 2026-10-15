@@ -59,6 +59,8 @@ typedef struct VState {
   GLWASM_Result err;
   const char * limit;
   int is_const;
+  /* A constant expression may read global.get x only for x below this. */
+  uint32_t const_globals;
   uint8_t * reffed;
   GLWASM_ValType * stack;
   uint32_t nstack;
@@ -197,20 +199,22 @@ static int abstract_sub(uint8_t actual, uint8_t expect) {
           expect == GLWASM_HT_ARRAY || expect == GLWASM_HT_EQ ||
           expect == GLWASM_HT_ANY;
     case GLWASM_HT_NOFUNC:
-      return expect == GLWASM_HT_FUNC || expect == GLWASM_HT_ANY;
+      return expect == GLWASM_HT_FUNC;
     case GLWASM_HT_NOEXTERN:
-      return expect == GLWASM_HT_EXTERN || expect == GLWASM_HT_ANY;
+      return expect == GLWASM_HT_EXTERN;
     case GLWASM_HT_NOEXN:
-      return expect == GLWASM_HT_EXN || expect == GLWASM_HT_ANY;
+      return expect == GLWASM_HT_EXN;
     case GLWASM_HT_I31:
     case GLWASM_HT_STRUCT:
     case GLWASM_HT_ARRAY:
       return expect == GLWASM_HT_EQ || expect == GLWASM_HT_ANY;
     case GLWASM_HT_EQ:
+      return expect == GLWASM_HT_ANY;
     case GLWASM_HT_FUNC:
     case GLWASM_HT_EXTERN:
     case GLWASM_HT_EXN:
-      return expect == GLWASM_HT_ANY;
+      /* The func, extern and exn hierarchies are separate from any. */
+      return 0;
     default:
       return 0;
   }
@@ -225,7 +229,7 @@ static int heap_sub(const GLWASM_Module * m, GLWASM_ValType actual,
     uint8_t comp = actual.index < m->ntypes ? m->types[actual.index].comp : 0;
 
     if (expect.heap == GLWASM_HT_ANY) {
-      return actual.index < m->ntypes;
+      return comp == GLWASM_COMP_STRUCT || comp == GLWASM_COMP_ARRAY;
     }
     if (expect.heap == GLWASM_HT_FUNC) {
       return comp == GLWASM_COMP_FUNC;
@@ -720,10 +724,9 @@ static int validate_fc(VState * v, const GLWASM_Instr * ins) {
     if (!mem_at(v, ins->a, &dst) || !mem_at(v, ins->b, &src)) {
       return 0;
     }
-    if (dst->addr64 != src->addr64) {
-      return fail(v, GLWASM_ERR_VALIDATE);
-    }
-    if (!pop_val(v, addr_type(dst->addr64), NULL) ||
+    /* The destination and source may differ in address type; the length
+     * has the narrower one (i32 when either is i32). */
+    if (!pop_val(v, addr_type(dst->addr64 && src->addr64), NULL) ||
         !pop_val(v, addr_type(src->addr64), NULL) ||
         !pop_val(v, addr_type(dst->addr64), NULL)) {
       return 0;
@@ -772,10 +775,12 @@ static int validate_fc(VState * v, const GLWASM_Instr * ins) {
     if (!table_at(v, ins->a, &dst) || !table_at(v, ins->b, &src)) {
       return 0;
     }
-    if (dst->addr64 != src->addr64 || !val_equal(dst->elem, src->elem)) {
+    /* The source element type must be a subtype of the destination's, and
+     * the address types may differ as for memory.copy. */
+    if (!val_sub(v->mod, src->elem, dst->elem)) {
       return fail(v, GLWASM_ERR_VALIDATE);
     }
-    if (!pop_val(v, addr_type(dst->addr64), NULL) ||
+    if (!pop_val(v, addr_type(dst->addr64 && src->addr64), NULL) ||
         !pop_val(v, addr_type(src->addr64), NULL) ||
         !pop_val(v, addr_type(dst->addr64), NULL)) {
       return 0;
@@ -1091,7 +1096,7 @@ static int validate_instr(VState * v, GLWASM_Func * fn, const GLWASM_Instr * ins
       }
       g = &v->mod->globals[ins->a];
       if (ins->op == 0x23) {
-        if (v->is_const && (!g->imported || g->mut)) {
+        if (v->is_const && (ins->a >= v->const_globals || g->mut)) {
           return fail(v, GLWASM_ERR_VALIDATE);
         }
         return push_val(v, g->type);
@@ -1236,6 +1241,8 @@ static int note_ref(VState * v, uint32_t func) {
   return 1;
 }
 
+/* C.refs: every function index that occurs outside function bodies and the
+ * start function. */
 static int scan_refs(VState * v, GLWASM_Func * fn) {
   uint32_t i;
 
@@ -1281,6 +1288,30 @@ static int validate_module(VState * v) {
         return 0;
       }
     }
+    if (!scan_refs(v, &el->offset)) {
+      return 0;
+    }
+  }
+  for (i = 0; i < m->nglobals; i++) {
+    if (!scan_refs(v, &m->globals[i].init)) {
+      return 0;
+    }
+  }
+  for (i = 0; i < m->ntables; i++) {
+    if (!scan_refs(v, &m->tables[i].init)) {
+      return 0;
+    }
+  }
+  for (i = 0; i < m->ndatas; i++) {
+    if (!scan_refs(v, &m->datas[i].offset)) {
+      return 0;
+    }
+  }
+  for (i = 0; i < m->nexports; i++) {
+    if (m->exports[i].kind == GLWASM_EXT_FUNC &&
+        !note_ref(v, m->exports[i].index)) {
+      return 0;
+    }
   }
   for (i = 0; i < m->nfuncs; i++) {
     const GLWASM_TypeDef * td;
@@ -1301,10 +1332,16 @@ static int validate_module(VState * v) {
   for (i = 0; i < m->nglobals; i++) {
     GLWASM_Global * g = &m->globals[i];
 
+    v->const_globals = i;
     if (!g->imported && !validate_expr(v, &g->init, 1, NULL, 0, &g->type, 1)) {
       return 0;
     }
   }
+  /* Tables are declared before any global is defined, so only the imported
+   * globals are visible to a table initializer. */
+  for (i = 0; i < m->nglobals && m->globals[i].imported; i++) {
+  }
+  v->const_globals = i;
   for (i = 0; i < m->ntables; i++) {
     GLWASM_Table * t = &m->tables[i];
 
@@ -1318,6 +1355,8 @@ static int validate_module(VState * v) {
       return 0;
     }
   }
+  /* An element or data offset runs after every global is initialized. */
+  v->const_globals = m->nglobals;
   for (i = 0; i < m->nelems; i++) {
     GLWASM_Elem * el = &m->elems[i];
     uint32_t k;

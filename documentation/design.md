@@ -35,7 +35,7 @@ static field name when the result is `ERR_LIMIT`, and NULL otherwise.
 
 | Result | Meaning |
 | --- | --- |
-| `GLWASM_ERR_CORRUPT` | The bytes are not a Wasm binary: bad magic or version, a truncated or over-long integer, a bad section size or order, non-UTF-8, a structural mismatch |
+| `GLWASM_ERR_CORRUPT` | The bytes are not a Wasm binary: bad magic or version, a truncated integer, an integer longer than ceil(N/7) bytes for its N bits, or one whose unused final bits are not zero (unsigned) or a sign extension (signed), a bad section size or order, non-UTF-8, a structural mismatch |
 | `GLWASM_ERR_UNSUPPORTED` | The grammar accepts it and this library does not implement it: a non-null or type-index reference, `v128`, a GC composite, the legacy `try` / `catch` / `rethrow` encodings, SIMD, atomics, the GC opcode prefix |
 | `GLWASM_ERR_VALIDATE` | The module is well-formed and breaks a validation rule: a type mismatch, an index out of range, `min` greater than `max`, an alignment past the natural one |
 | `GLWASM_ERR_LIMIT` | A `GLWASM_Limits` field. Checked before the allocation that would have satisfied it. `GLWASM_Failure.limit` names the field. `glwasm_result_string` stays "Limit exceeded" |
@@ -80,7 +80,7 @@ later story adds named presets. There is no feature switch.
 
 A missing memory or table maximum is the address type's own maximum, and that
 effective maximum is what the cap sees. An i32 memory's own maximum is 65,536
-pages (4 GiB). An i64 memory's is 2^48 pages. An i32 table's is 2^32 elements.
+pages (4 GiB). An i64 memory's is 2^48 pages. An i32 table's is 2^32−1 elements, so a limit of 2^32 is `ERR_VALIDATE`.
 An i64 table's is 2^64−1 elements. So `(memory 1)` with no maximum fails
 `memory_maximum` under the default. The cap is checked first (`ERR_LIMIT`);
 a minimum above the maximum, or a maximum past the address type's own
@@ -107,12 +107,21 @@ Numeric types match only themselves. References use the 3.0 heap lattice:
 - `none` is the bottom of `eq`, `i31`, `struct` and `array`.
 - `nofunc` is the bottom of `func` and of a concrete function type.
 - `noextern` is the bottom of `extern`. `noexn` is the bottom of `exn`.
-- `eq`, `func`, `extern` and `exn` are subtypes of `any`.
+- `eq` is a subtype of `any`. `func`, `extern` and `exn` are the tops of
+  lattices of their own, and none of them is a subtype of `any`.
 - A concrete type index is a subtype of the supers its definition declares.
   Struct and array fields are compared there too: a mutable field is
   invariant, an immutable field is covariant.
 - A non-null reference may flow to the nullable reference of a supertype. A
   nullable reference may not flow to a non-null one.
+
+The bottom heap types of the in-scope lattices, `nofunc`, `noextern` and
+`noexn`, are in scope as nullable references (`ref.null nofunc`, a table of
+`(ref null nofunc)`, a block result), and are checked as subtypes of `func`,
+`extern` and `exn`. They are part of the `funcref`, `externref` and `exnref`
+lattices that reference types and exception handling use, not of GC. The
+`any` hierarchy's heap types (`any`, `eq`, `i31`, `struct`, `array`, `none`)
+stay `ERR_UNSUPPORTED`.
 
 `ref.func` is in scope and produces a non-null `(ref func)`, which is a
 subtype of `funcref`. Declaring that non-null type, or any other non-null or
@@ -121,3 +130,35 @@ type-index reference, in the type section is deferred and returns
 
 `call_indirect` accepts a `funcref` table because `(ref null ft)` is a subtype
 of `(ref null func)`.
+
+## Integers
+
+Every LEB128 integer may be padded up to ceil(N/7) bytes for an N-bit value
+(5 for a `u32`, `s32` or `s33`, 10 for a 64-bit value), so `0x80 0x80 0x00` is
+a legal zero. An encoding longer than that is `ERR_CORRUPT`, and so is one
+whose unused bits in the final byte are not zero (unsigned) or not a sign
+extension of the value (signed). This holds at every read site. Tools that
+patch in a size or an index commonly pad it.
+
+## Constant expressions and declared functions
+
+`ref.func x` in a function body needs `x` to be declared: it must occur in the
+module outside function bodies and the start function (the specification's
+`C.refs`). That is every function index in an element segment (either form,
+its offset too), a global or table initializer, a data offset, and a function
+export. The start function does not declare anything.
+
+`global.get` in a constant expression reads an immutable global. A global's
+initializer sees the imports and the globals defined before it. An element or
+data offset sees every global. A table initializer sees the imports only,
+because the table section precedes the global section, as V8 also requires.
+A mutable global, a later global, or the global itself is `ERR_VALIDATE`.
+
+## Mixed address types
+
+`memory.copy` and `table.copy` may name an i32 and an i64 memory or table.
+The destination and source operands have their own address types and the
+length has the narrower one (i32 when either is i32). `table.copy` needs only
+that the source element type be a subtype of the destination's. V8 12.4
+rejects the mixed forms; the specification allows them and so does
+lang-wasm. `tests/unit/test_types.cpp` pins it.

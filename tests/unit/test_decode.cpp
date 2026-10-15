@@ -539,7 +539,10 @@ TEST(Decode, OnePastEachLimit) {
 }
 
 TEST(Decode, OverlongSectionCountIsCorrupt) {
-  std::vector<uint8_t> bytes = hex("00 61 73 6d 01 00 00 00 01 02 80 00");
+  /* Six bytes for a u32 count is longer than ceil(32/7) = 5 allows. A padded
+   * count of five bytes or fewer is legal (test_leb.cpp). */
+  std::vector<uint8_t> bytes = hex(
+      "00 61 73 6d 01 00 00 00 01 07 80 80 80 80 80 00");
   GLWASM_Module * module = reinterpret_cast<GLWASM_Module *>(1);
 
   EXPECT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), NULL, NULL, NULL,

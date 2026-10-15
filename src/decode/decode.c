@@ -124,9 +124,6 @@ static int read_unsigned(Reader * r, uint64_t * out, int nbits) {
     result |= (uint64_t)(byte & 0x7fu) << (i * 7);
     if ((byte & 0x80u) == 0) {
       remain = nbits - i * 7;
-      if (i > 0 && (byte & 0x7fu) == 0) {
-        return fail(r, GLWASM_ERR_CORRUPT);
-      }
       if (remain < 7 && ((byte & 0x7fu) >> remain) != 0) {
         return fail(r, GLWASM_ERR_CORRUPT);
       }
@@ -153,16 +150,6 @@ static int read_signed(Reader * r, int64_t * out, int nbits) {
     if ((byte & 0x80u) == 0) {
       int remain = nbits - i * 7;
 
-      if (i > 0) {
-        unsigned prev_neg =
-            (unsigned)((result >> (((i - 1) * 7) + 6)) & 1ull);
-        unsigned payload = (unsigned)(byte & 0x7fu);
-
-        if ((prev_neg == 0 && payload == 0x00u) ||
-            (prev_neg != 0 && payload == 0x7fu)) {
-          return fail(r, GLWASM_ERR_CORRUPT);
-        }
-      }
       if (remain < 7) {
         uint8_t payload = (uint8_t)(byte & 0x7fu);
         uint8_t used = (uint8_t)((1u << remain) - 1u);
@@ -307,8 +294,12 @@ static int ref_in_scope(const GLWASM_ValType * t) {
   if (t->kind != GLWASM_VK_REF || !t->nullable) {
     return 0;
   }
+  /* The bottom types are in the func, extern and exn lattices that
+   * reference types and exception handling use. The any hierarchy's heap
+   * types (any, eq, i31, struct, array, none) are GC and stay deferred. */
   return t->heap == GLWASM_HT_FUNC || t->heap == GLWASM_HT_EXTERN ||
-      t->heap == GLWASM_HT_EXN;
+      t->heap == GLWASM_HT_EXN || t->heap == GLWASM_HT_NOFUNC ||
+      t->heap == GLWASM_HT_NOEXTERN || t->heap == GLWASM_HT_NOEXN;
 }
 
 static int heap_from_byte(uint8_t b, uint8_t * heap) {
@@ -571,7 +562,7 @@ static int check_memory(Reader * r, const LimInfo * lim) {
 }
 
 static int check_table_size(Reader * r, const LimInfo * lim) {
-  uint64_t spec = lim->addr64 ? UINT64_MAX : (1ull << 32);
+  uint64_t spec = lim->addr64 ? UINT64_MAX : UINT32_MAX;
   uint64_t eff = lim->has_max ? lim->max : spec;
 
   if (lim->min > r->limits->table_size || eff > r->limits->table_size) {

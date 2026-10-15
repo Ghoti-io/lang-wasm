@@ -401,6 +401,19 @@ TEST(Decode, FuncrefIsInScope) {
   glwasm_module_destroy(module);
 }
 
+TEST(Decode, ExplicitNonNullAbstractHeapTypeIsDeferred) {
+  std::vector<uint8_t> bytes = hex(
+      "00 61 73 6d 01 00 00 00"
+      "01 06 01 60 01 64 70 00"
+      "03 02 01 00"
+      "0a 07 01 05 00 20 00 1a 0b");
+  GLWASM_Module * module = NULL;
+
+  EXPECT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), NULL, NULL, NULL,
+      &module), GLWASM_ERR_UNSUPPORTED);
+  EXPECT_EQ(module, nullptr);
+}
+
 TEST(Decode, DefaultsMatchTheNumberedCaps) {
   GLWASM_Limits limits;
 
@@ -621,6 +634,45 @@ TEST(Decode, UnboundedMemoryHitsTheMaximum) {
       &failure, &module), GLWASM_ERR_LIMIT);
   EXPECT_STREQ(failure.limit, "memory_maximum");
   EXPECT_EQ(module, reinterpret_cast<GLWASM_Module *>(1));
+}
+
+TEST(Decode, LocalIndexSpaceOverflowIsMalformed) {
+  std::vector<uint8_t> bytes = hex(
+      "00 61 73 6d 01 00 00 00 "
+      "01 06 01 60 02 7f 7f 00 "
+      "03 02 01 00 "
+      "0a 0a 01 08 01 ff ff ff ff 0f 7f 0b");
+  GLWASM_Limits limits = loose();
+  GLWASM_Failure failure{};
+  GLWASM_Module * module = nullptr;
+  limits.locals = UINT32_MAX;
+  EXPECT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), &limits, nullptr,
+                                 &failure, &module),
+            GLWASM_ERR_CORRUPT);
+  EXPECT_EQ(failure.result, GLWASM_ERR_CORRUPT);
+  EXPECT_EQ(module, nullptr);
+}
+
+TEST(Decode, DataInstructionsRequireDataCountSection) {
+  const char * cases[] = {
+      "00 61 73 6d 01 00 00 00 "
+      "01 07 01 60 03 7f 7f 7f 00 "
+      "03 02 01 00 "
+      "0a 0e 01 0c 00 41 00 41 00 41 00 fc 08 00 00 0b",
+      "00 61 73 6d 01 00 00 00 "
+      "01 04 01 60 00 00 "
+      "03 02 01 00 "
+      "0a 07 01 05 00 fc 09 00 0b"};
+  for (const char * encoded : cases) {
+    std::vector<uint8_t> bytes = hex(encoded);
+    GLWASM_Failure failure{};
+    GLWASM_Module * module = nullptr;
+    EXPECT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), nullptr, nullptr,
+                                   &failure, &module),
+              GLWASM_ERR_CORRUPT);
+    EXPECT_EQ(failure.result, GLWASM_ERR_CORRUPT);
+    EXPECT_EQ(module, nullptr);
+  }
 }
 
 TEST(Decode, MemoryMinimumAboveMaximum) {

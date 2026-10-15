@@ -41,6 +41,14 @@ STATIC_TARGET := $(BASE_NAME_PREFIX).a
 
 PKG_CONFIG_PATH_ENV := $(PKG_CONFIG_PATH)
 
+# The test corpus is fetched and pinned by runtime-jit's tools/wasm. These
+# paths configure only the cross-library spec-suite test gate.
+WASM_SPEC_COMMIT := $(shell cat ../runtime-jit/tools/wasm/WASM_SPEC_COMMIT)
+WASM_SPEC_DIR ?= ../runtime-jit/third_party/wasm-spec/$(WASM_SPEC_COMMIT)
+export GLWASM_WAST_CORPUS_ROOT := $(abspath $(WASM_SPEC_DIR)/test)
+export GLWASM_WAST_CLASSIFICATION := $(abspath tests/data-wast-classification.tsv)
+export GLWASM_WAST_ASSERTION_SKIPS := $(abspath tests/data-wast-assertion-skips.tsv)
+
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S), Linux)
@@ -154,7 +162,7 @@ endif
 
 INCLUDE := -I include/ -I $(GEN_DIR)/ -I src/
 
-DEPLESS_GOALS := docs docs-pdf clean fuzz-clean cloc help
+DEPLESS_GOALS := docs docs-pdf clean fuzz-clean cloc help check-wast-corpus
 ifeq ($(filter-out $(DEPLESS_GOALS),$(or $(MAKECMDGOALS),all)),)
 SKIP_DEP_CHECK := 1
 endif
@@ -175,7 +183,7 @@ LIBOBJECTS := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cflags gtest`
 
-TEST_GATES ?= check-symbols check-aliasing check-stamps check-labels check-edges fuzz-replay
+TEST_GATES ?= check-symbols check-aliasing check-stamps check-labels check-edges check-wast-corpus fuzz-replay
 
 VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible --track-origins=yes --error-exitcode=1 --suppressions=tests/valgrind.supp
 
@@ -264,7 +272,7 @@ endef
 $(foreach pair,$(TEST_PAIRS),\
 	$(eval $(call test-executable-rule,$(word 1,$(subst |, ,$(pair))),$(word 2,$(subst |, ,$(pair))))))
 
-.PHONY: clean cloc docs docs-pdf coverage check-symbols check-stamps check-aliasing check-labels check-edges
+.PHONY: clean cloc docs docs-pdf coverage check-symbols check-stamps check-aliasing check-labels check-edges check-wast-corpus
 .PHONY: all install test test-quiet test-asan test-valgrind uninstall
 .PHONY: fuzz fuzz-clean fuzz-replay help
 
@@ -311,6 +319,12 @@ check-labels: ## Fail if a public header has no @stability free label
 check-edges: $(APP_DIR)/$(TARGET) ## Fail on a dependency other than cutil
 	@tools/check-edges.sh --includes .
 	@tools/check-edges.sh --links $(APP_DIR)
+
+check-wast-corpus: ## Fail on corpus drift or an incomplete file classification
+	@python3 tools/check-wast-corpus.py --metadata ../runtime-jit/tools/wasm \
+		--corpus ../runtime-jit/third_party/wasm-spec \
+		--classification tests/data-wast-classification.tsv \
+		--assertion-skips tests/data-wast-assertion-skips.tsv
 
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES) ## Build and run the tests
 	@for test_exe in $(TEST_EXECUTABLES); do \

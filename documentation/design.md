@@ -162,3 +162,48 @@ length has the narrower one (i32 when either is i32). `table.copy` needs only
 that the source element type be a subtype of the destination's. V8 12.4
 rejects the mixed forms; the specification allows them and so does
 lang-wasm. `tests/unit/test_types.cpp` pins it.
+# Text syntax parser
+
+`parse.h` exposes a reusable syntax tree for source text. Each node owns its
+bytes and children through the caller's allocator (or the default allocator),
+and carries a byte offset plus one-based line and column. Nested `(; ;)`
+comments, line comments, lists, atoms and quoted byte strings are recognized,
+including byte and Unicode escapes. `script.h` classifies top-level WAST
+commands into typed command kinds and retains the original syntax node for a
+future executor. Source must be valid UTF-8, byte escapes retain arbitrary
+string bytes, and nesting deeper than 256 levels is rejected to bound stack
+use. Command envelopes validate actions, constant arguments and assertion
+values while leaving execution to the runtime adapter. `glwasm_wat_module_parse`
+lowers a currently narrow function
+subset (function imports, numeric params/results including multi-value results,
+explicit named/numeric function types and type uses, exports, folded numeric
+operations, linear integer/floating constants, scalar numeric operators,
+numeric and named locals, function/table/memory/global imports, start functions, direct
+and indirect calls, reference null/function instructions, table get/set, numeric
+branch tables, basic block/loop/if control, defined tables/memories including
+memory64/table64 declarations,
+function-index and expression-form element segments, active/passive data
+segments, selected bulk memory/table instructions, multi-memory scalar accesses,
+and constant numeric globals) to canonical
+binary sections, then reuses the decoder and validator. The lowering rejects
+unsupported module fields and instructions explicitly. It does not yet cover
+the in-scope WAT grammar; generated-binary validation errors currently point
+to the module form, while syntax/lowering errors point to their source form.
+Assertion execution remains pending for the interpreter adapter.
+
+## Pinned WAST corpus gate
+
+The spec-suite input is pinned in the adjacent `runtime-jit` repository at
+the immutable commit in `tools/wasm/WASM_SPEC_COMMIT`. Its fetch script reads
+`WAST_FILES`, checks each fetched file against `SHA256SUMS`, and retains the
+existing ten scalar numeric inputs used by runtime-jit's execution harness.
+`tests/data-wast-classification.tsv` assigns every `.wast` file either `run`
+or `skip(reason)`, with skip reasons limited to the feature-scope vocabulary.
+The corpus checker requires each file-level skip to have a matching deferred
+feature marker or suite path. Mixed files stay `run`; individual deferred
+module commands or assertions are listed in
+`tests/data-wast-assertion-skips.tsv` and are counted by reason.
+`make test` checks the exact fetched file set, all digests and the exhaustive
+classification before it parses the corpus through the public WAST command
+parser. Assertion execution is reported as pending and is not counted as a
+pass until the interpreter adapter is added.

@@ -368,6 +368,29 @@ static int read_heap(Reader * r, GLWASM_ValType * t, int nullable) {
   if (!read_s33(r, &idx)) {
     return 0;
   }
+  /* Explicit heap types use signed s33 encodings. Keep the function,
+   * extern, and exception heaps in the validator's supported set; parse GC
+   * heap types so the module can be classified as deferred instead of bad
+   * binary. */
+  switch (idx) {
+    case -16: heap = GLWASM_HT_FUNC; break;
+    case -17: heap = GLWASM_HT_EXTERN; break;
+    case -23: heap = GLWASM_HT_EXN; break;
+    case -18: heap = GLWASM_HT_ANY; r->deferred = 1; break;
+    case -19: heap = GLWASM_HT_EQ; r->deferred = 1; break;
+    case -20: heap = GLWASM_HT_I31; r->deferred = 1; break;
+    case -21: heap = GLWASM_HT_STRUCT; r->deferred = 1; break;
+    case -22: heap = GLWASM_HT_ARRAY; r->deferred = 1; break;
+    default: heap = GLWASM_HT_NONE; break;
+  }
+  if (heap != GLWASM_HT_NONE) {
+    t->kind = GLWASM_VK_REF;
+    t->nullable = (uint8_t)nullable;
+    t->heap = heap;
+    t->index = 0;
+    if (!ref_in_scope(t)) r->deferred = 1;
+    return 1;
+  }
   if (idx < 0) {
     return fail(r, GLWASM_ERR_CORRUPT);
   }
@@ -539,6 +562,13 @@ static int check_memory(Reader * r, const LimInfo * lim) {
   uint64_t min_bytes;
   uint64_t eff_bytes;
 
+  /* Reject a core-spec size violation as invalid before applying host
+   * allocation caps; those caps describe resource policy, not Wasm validity. */
+  if (lim->min > spec || (lim->has_max &&
+      (lim->max < lim->min || lim->max > spec))) {
+    return fail(r, GLWASM_ERR_VALIDATE);
+  }
+
   if (lim->min > UINT64_MAX / GLWASM_PAGE) {
     return fail_limit(r, "memory_initial");
   }
@@ -548,29 +578,35 @@ static int check_memory(Reader * r, const LimInfo * lim) {
   }
   eff = lim->has_max ? lim->max : spec;
   if (eff > UINT64_MAX / GLWASM_PAGE) {
-    return fail_limit(r, "memory_maximum");
+    /* A 64-bit unbounded memory has a theoretical maximum of 2^64 bytes,
+     * one page beyond uint64_t. UINT64_MAX is the largest host cap; treat it
+     * as covering this unallocated theoretical endpoint. */
+    if (r->limits->memory_maximum != UINT64_MAX) {
+      return fail_limit(r, "memory_maximum");
+    }
   }
-  eff_bytes = eff * GLWASM_PAGE;
-  if (eff_bytes > r->limits->memory_maximum) {
-    return fail_limit(r, "memory_maximum");
-  }
-  if (lim->min > spec || (lim->has_max && (lim->max < lim->min ||
-      lim->max > spec))) {
-    return fail(r, GLWASM_ERR_VALIDATE);
+  else {
+    eff_bytes = eff * GLWASM_PAGE;
+    if (eff_bytes > r->limits->memory_maximum) {
+      return fail_limit(r, "memory_maximum");
+    }
   }
   return 1;
 }
 
 static int check_table_size(Reader * r, const LimInfo * lim) {
   uint64_t spec = lim->addr64 ? UINT64_MAX : UINT32_MAX;
-  uint64_t eff = lim->has_max ? lim->max : spec;
-
-  if (lim->min > r->limits->table_size || eff > r->limits->table_size) {
-    return fail_limit(r, "table_size");
-  }
+  /* A missing maximum is not a declaration that the table has `spec`
+   * elements. The configured cap applies to the initial size and to an
+   * explicitly declared maximum; using the proposal's theoretical maximum
+   * here rejected every ordinary unbounded table. */
   if (lim->min > spec || (lim->has_max && (lim->max < lim->min ||
       lim->max > spec))) {
     return fail(r, GLWASM_ERR_VALIDATE);
+  }
+  if (lim->min > r->limits->table_size ||
+      (lim->has_max && lim->max > r->limits->table_size)) {
+    return fail_limit(r, "table_size");
   }
   return 1;
 }
@@ -1151,6 +1187,11 @@ static int read_locals(Reader * r, GLWASM_Func * fn) {
 
     if (!read_u32(r, &count) || !read_valtype(r, &type)) {
       return 0;
+    }
+    /* The local index space is u32-sized. A group whose sum with the
+     * parameters overflows that space is malformed regardless of host caps. */
+    if (count > UINT32_MAX - n) {
+      return fail(r, GLWASM_ERR_CORRUPT);
     }
     if (count > r->limits->locals - n) {
       return fail_limit(r, "locals");
@@ -1799,7 +1840,8 @@ static int parse_elems(Reader * r) {
         ((flags & 3u) == 1 ? GLWASM_ELEM_PASSIVE : GLWASM_ELEM_DECLARATIVE);
     el->use_exprs = (uint8_t)use_exprs;
     el->reftype.kind = GLWASM_VK_REF;
-    el->reftype.nullable = 1;
+    /* Legacy function-index segments contain non-null function references. */
+    el->reftype.nullable = (uint8_t)use_exprs;
     el->reftype.heap = GLWASM_HT_FUNC;
     if (active && (flags & 2u) && !read_u32(r, &el->table)) {
       return 0;
@@ -1807,6 +1849,8 @@ static int parse_elems(Reader * r) {
     if (active && !read_expr(r, &el->offset, 1)) {
       return 0;
     }
+    /* Expression-form element segments carry their reference type after the
+     * offset (for active segments) and before the expression vector. */
     if (r->skip_rest) {
       return 1;
     }
@@ -2135,6 +2179,19 @@ static int parse_module(Reader * r) {
   }
   if (r->mod->has_data_count && r->mod->ndatas != r->mod->data_count) {
     return fail(r, GLWASM_ERR_CORRUPT);
+  }
+  if (!r->mod->has_data_count) {
+    uint32_t f;
+    for (f = 0; f < r->mod->nfuncs; ++f) {
+      uint32_t i;
+      for (i = 0; i < r->mod->funcs[f].nins; ++i) {
+        uint16_t op = r->mod->funcs[f].ins[i].op;
+        if (op == 0xfc08u || op == 0xfc09u) {
+          /* These instructions make DataCount part of the binary grammar. */
+          return fail(r, GLWASM_ERR_CORRUPT);
+        }
+      }
+    }
   }
   if (r->mod->nfuncs > r->mod->nimported_funcs) {
     uint32_t f;

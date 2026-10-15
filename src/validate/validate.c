@@ -52,6 +52,8 @@ typedef struct VFrame {
   uint32_t nparams;
   const GLWASM_ValType * results;
   uint32_t nresults;
+  uint8_t * local_init_snapshot;
+  uint8_t * then_local_init_snapshot;
 } VFrame;
 
 typedef struct VState {
@@ -68,6 +70,8 @@ typedef struct VState {
   VFrame * frames;
   uint32_t nframes;
   uint32_t fcap;
+  uint8_t * local_initialized;
+  uint32_t nlocal_initialized;
 } VState;
 
 static GLWASM_ValType num_type(uint8_t kind) {
@@ -468,14 +472,32 @@ static int enter_block(VState * v, uint8_t kind, const GLWASM_BlockType * bt,
   frame.nparams = bt->nparams;
   frame.results = results;
   frame.nresults = bt->nresults;
+  if (v->local_initialized && v->nlocal_initialized) {
+    frame.local_init_snapshot =
+        gcu_allocator_malloc(&v->mod->alloc, v->nlocal_initialized);
+    if (!frame.local_init_snapshot)
+      return fail(v, GLWASM_ERR_OOM);
+    memcpy(frame.local_init_snapshot, v->local_initialized,
+           v->nlocal_initialized);
+    if (kind == GLWASM_V_IF) {
+      frame.then_local_init_snapshot =
+          gcu_allocator_malloc(&v->mod->alloc, v->nlocal_initialized);
+      if (!frame.then_local_init_snapshot) {
+        gcu_allocator_free(&v->mod->alloc, frame.local_init_snapshot);
+        return fail(v, GLWASM_ERR_OOM);
+      }
+    }
+  }
   if (!push_frame(v, frame)) {
+    gcu_allocator_free(&v->mod->alloc, frame.local_init_snapshot);
+    gcu_allocator_free(&v->mod->alloc, frame.then_local_init_snapshot);
     return 0;
   }
   return push_vals(v, params, bt->nparams);
 }
 
-static int func_type(const GLWASM_Module * m, uint32_t index,
-    const GLWASM_TypeDef * * out) {
+static int func_type(const GLWASM_Module *m, uint32_t index,
+                     const GLWASM_TypeDef **out) {
   if (index >= m->ntypes || m->types[index].comp != GLWASM_COMP_FUNC) {
     return 0;
   }
@@ -863,10 +885,16 @@ static int validate_instr(VState * v, GLWASM_Func * fn, const GLWASM_Instr * ins
       }
       f->else_seen = 1;
       f->unreachable = 0;
+      if (f->then_local_init_snapshot)
+        memcpy(f->then_local_init_snapshot, v->local_initialized,
+               v->nlocal_initialized);
+      if (f->local_init_snapshot)
+        memcpy(v->local_initialized, f->local_init_snapshot,
+               v->nlocal_initialized);
       return push_vals(v, f->params, f->nparams);
     }
     case 0x0b: {
-      VFrame * f = top(v);
+      VFrame *f = top(v);
 
       if (!f) {
         return fail(v, GLWASM_ERR_VALIDATE);
@@ -882,16 +910,33 @@ static int validate_instr(VState * v, GLWASM_Func * fn, const GLWASM_Instr * ins
         return fail(v, GLWASM_ERR_VALIDATE);
       }
       {
-        const GLWASM_ValType * results = f->results;
+        const GLWASM_ValType *results = f->results;
         uint32_t nresults = f->nresults;
-
+        if (f->local_init_snapshot) {
+          if (f->kind == GLWASM_V_IF) {
+            if (f->else_seen && f->then_local_init_snapshot) {
+              for (uint32_t i = 0; i < v->nlocal_initialized; i++)
+                v->local_initialized[i] &= f->then_local_init_snapshot[i];
+            } else {
+              memcpy(v->local_initialized, f->local_init_snapshot,
+                     v->nlocal_initialized);
+            }
+          } else if (f->kind != GLWASM_V_BLOCK) {
+            memcpy(v->local_initialized, f->local_init_snapshot,
+                   v->nlocal_initialized);
+          }
+          gcu_allocator_free(&v->mod->alloc, f->local_init_snapshot);
+          f->local_init_snapshot = NULL;
+          gcu_allocator_free(&v->mod->alloc, f->then_local_init_snapshot);
+          f->then_local_init_snapshot = NULL;
+        }
         v->nframes--;
         return push_vals(v, results, nresults);
       }
     }
     case 0x08: {
-      const GLWASM_TypeDef * td;
-      const GLWASM_Tag * tag;
+      const GLWASM_TypeDef *td;
+      const GLWASM_Tag *tag;
 
       if (ins->a >= v->mod->ntags) {
         return fail(v, GLWASM_ERR_VALIDATE);
@@ -957,7 +1002,8 @@ static int validate_instr(VState * v, GLWASM_Func * fn, const GLWASM_Instr * ins
           return fail(v, GLWASM_ERR_VALIDATE);
         }
         lt = label_types(lab, &ln);
-        if (!same_seq(lt, ln, types, n)) {
+        if ((top(v)->unreachable && ln != n) ||
+            (!top(v)->unreachable && !same_seq(lt, ln, types, n))) {
           return fail(v, GLWASM_ERR_VALIDATE);
         }
       }
@@ -1078,18 +1124,27 @@ static int validate_instr(VState * v, GLWASM_Func * fn, const GLWASM_Instr * ins
         return fail(v, GLWASM_ERR_VALIDATE);
       }
       if (ins->op == 0x20) {
+        if (v->local_initialized && ins->a < v->nlocal_initialized &&
+            fn->locals[ins->a].kind == GLWASM_VK_REF &&
+            !fn->locals[ins->a].nullable && !v->local_initialized[ins->a]) {
+          return fail(v, GLWASM_ERR_VALIDATE);
+        }
         return push_val(v, fn->locals[ins->a]);
       }
       if (!pop_val(v, fn->locals[ins->a], NULL)) {
         return 0;
       }
       if (ins->op == 0x22) {
+        if (v->local_initialized && ins->a < v->nlocal_initialized)
+          v->local_initialized[ins->a] = 1;
         return push_val(v, fn->locals[ins->a]);
       }
+      if (v->local_initialized && ins->a < v->nlocal_initialized)
+        v->local_initialized[ins->a] = 1;
       return 1;
     case 0x23:
     case 0x24: {
-      const GLWASM_Global * g;
+      const GLWASM_Global *g;
 
       if (ins->a >= v->mod->nglobals) {
         return fail(v, GLWASM_ERR_VALIDATE);
@@ -1196,7 +1251,7 @@ static int const_opcode(uint16_t op) {
       op == 0x6c || op == 0x7c || op == 0x7d || op == 0x7e;
 }
 
-static int validate_expr(VState * v, GLWASM_Func * fn, int is_const,
+static int validate_expr_body(VState * v, GLWASM_Func * fn, int is_const,
     const GLWASM_ValType * params, uint32_t nparams,
     const GLWASM_ValType * results, uint32_t nresults) {
   VFrame frame;
@@ -1233,7 +1288,37 @@ static int validate_expr(VState * v, GLWASM_Func * fn, int is_const,
   return 1;
 }
 
-static int note_ref(VState * v, uint32_t func) {
+static int validate_expr(VState *v, GLWASM_Func *fn, int is_const,
+                         const GLWASM_ValType *params, uint32_t nparams,
+                         const GLWASM_ValType *results, uint32_t nresults) {
+  uint8_t *initialized = NULL;
+  uint32_t i;
+  int ok;
+
+  if (!is_const && fn->nlocals) {
+    initialized =
+        gcu_allocator_calloc(&v->mod->alloc, fn->nlocals, sizeof(*initialized));
+    if (!initialized)
+      return fail(v, GLWASM_ERR_OOM);
+    for (i = 0; i < fn->nparams && i < fn->nlocals; i++)
+      initialized[i] = 1;
+  }
+  v->local_initialized = initialized;
+  v->nlocal_initialized = initialized ? fn->nlocals : 0;
+  ok = validate_expr_body(v, fn, is_const, params, nparams, results, nresults);
+  for (i = 0; i < v->nframes; i++) {
+    gcu_allocator_free(&v->mod->alloc, v->frames[i].local_init_snapshot);
+    v->frames[i].local_init_snapshot = NULL;
+    gcu_allocator_free(&v->mod->alloc, v->frames[i].then_local_init_snapshot);
+    v->frames[i].then_local_init_snapshot = NULL;
+  }
+  gcu_allocator_free(&v->mod->alloc, initialized);
+  v->local_initialized = NULL;
+  v->nlocal_initialized = 0;
+  return ok;
+}
+
+static int note_ref(VState *v, uint32_t func) {
   if (func >= v->mod->nfuncs) {
     return fail(v, GLWASM_ERR_VALIDATE);
   }
@@ -1243,7 +1328,7 @@ static int note_ref(VState * v, uint32_t func) {
 
 /* C.refs: every function index that occurs outside function bodies and the
  * start function. */
-static int scan_refs(VState * v, GLWASM_Func * fn) {
+static int scan_refs(VState *v, GLWASM_Func *fn) {
   uint32_t i;
 
   for (i = 0; i < fn->nins; i++) {

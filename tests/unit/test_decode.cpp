@@ -28,6 +28,7 @@
 #include <ghoti.io/lang-wasm/lang-wasm.h>
 
 #include "module_internal.h"
+#include "runtime/runtime.h"
 
 #include <gtest/gtest.h>
 
@@ -323,6 +324,392 @@ TEST(Decode, MinimalModule) {
   glwasm_module_destroy(module);
 }
 
+TEST(Decode, TranslationOffsetsAreTotalMonotonicAndInRange) {
+  std::vector<uint8_t> bytes = hex(k_add);
+  GLWASM_Module * module = NULL;
+  ASSERT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), NULL, NULL, NULL,
+      &module), GLWASM_OK);
+  ASSERT_NE(module, nullptr);
+  ASSERT_EQ(module->nfuncs, 1u);
+  const GLWASM_TranslatedFunc * translated = module->funcs[0].translated;
+  ASSERT_NE(translated, nullptr);
+  ASSERT_EQ(translated->offset_count, translated->nins + 1u);
+  ASSERT_EQ(translated->nins, module->funcs[0].nins);
+  for (uint32_t i = 0; i < translated->offset_count; ++i) {
+    EXPECT_LT(translated->offsets[i], bytes.size());
+    if (i != 0) {
+      EXPECT_LE(translated->offsets[i - 1], translated->offsets[i]);
+    }
+  }
+  for (uint32_t i = 0; i < translated->nins; ++i) {
+    EXPECT_EQ(translated->ins[i].source.source_offset,
+        translated->offsets[i]);
+  }
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, TranslationResolvesBlockBranchAfterEnd) {
+  static const char wat[] =
+      "(module (func (block (br 0))))";
+  GLWASM_Module * module = NULL;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(
+      reinterpret_cast<const uint8_t *>(wat), sizeof(wat) - 1u, NULL, NULL,
+      &error, &module), GLWASM_OK) << (error.message ? error.message : "");
+  ASSERT_NE(module, nullptr);
+  const GLWASM_TranslatedFunc * translated = module->funcs[0].translated;
+  ASSERT_NE(translated, nullptr);
+  uint32_t branch = translated->nins;
+  uint32_t block_end = translated->nins;
+  for (uint32_t i = 0; i < translated->nins; ++i) {
+    if (translated->ins[i].source.op == 0x0c) branch = i;
+    if (translated->ins[i].source.op == 0x0b && i != translated->nins - 1u)
+      block_end = i;
+  }
+  ASSERT_LT(branch, translated->nins);
+  ASSERT_LT(block_end, translated->nins);
+  EXPECT_EQ(translated->ins[branch].branch_target, block_end + 1u);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimeExecutesNumericFunctionOnGuestStack) {
+  static const char wat[] =
+      "(module (func (export \"run\") (result i32) "
+      "(i32.add (i32.const 19) (i32.const 23))))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 0, nullptr, 0, &value), GLWASM_OK);
+  EXPECT_EQ(value, 42u);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimeRunsStartAndUsesPortableArithmeticShift) {
+  static const char wat[] =
+      "(module (global $state (mut i32) (i32.const 0)) "
+      "(func $init (global.set $state (i32.const 42))) (start $init) "
+      "(func (export \"run\") (result i32) "
+      "(i32.shr_s (i32.const -8) (i32.const 1))) "
+      "(func (export \"state\") (result i32) (global.get $state)))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 1, nullptr, 0, &value), GLWASM_OK);
+  EXPECT_EQ(value, UINT32_C(0xfffffffc));
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 2, nullptr, 0, &value), GLWASM_OK);
+  EXPECT_EQ(value, 42u);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimeRejectsMultiResultCalleeAndClearsOutputOnFailure) {
+  static const char wat[] =
+      "(module (func (result i32 i32) (i32.const 1) (i32.const 2)) "
+      "(func (export \"run\") (result i32) (drop (call 0))))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 1, nullptr, 0, &value),
+      GLWASM_ERR_UNSUPPORTED);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+
+  runtime = reinterpret_cast<GLWASM_Runtime *>(1);
+  EXPECT_EQ(glwasm_runtime_create(nullptr, &runtime), GLWASM_ERR_INVALID);
+  EXPECT_EQ(runtime, nullptr);
+}
+
+TEST(Decode, RuntimeRejectsUnboundImportedGlobals) {
+  static const char wat[] =
+      "(module (import \"other\" \"global_i32\" (global i32)) "
+      "(func (export \"run\") (result i32) (global.get 0)))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  GLWASM_Runtime *runtime = nullptr;
+  EXPECT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_ERR_UNSUPPORTED);
+  EXPECT_EQ(runtime, nullptr);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimeUsesConfiguredGuestDepthAndMovingStack) {
+  static const char wat[] =
+      "(module (func (export \"run\") (call 0)))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK);
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  ASSERT_EQ(glwasm_runtime_set_test_limits(runtime, UINT64_MAX, 3, 1), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 0, nullptr, 0, &value), GLWASM_ERR_LIMIT);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimeReportsMappedWasmTrapKind) {
+  static const char wat[] =
+      "(module (func (export \"run\") (result i32) "
+      "(i32.div_s (i32.const 1) (i32.const 0))))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK);
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 0, nullptr, 0, &value), GLWASM_ERR_GUEST);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime), GLWASM_TRAP_DIVIDE_BY_ZERO);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimePausesAndResumesAtSavedInstruction) {
+  static const char wat[] =
+      "(module (func (export \"run\") (result i32) "
+      "(i32.add (i32.const 19) (i32.const 23))))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK);
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  ASSERT_EQ(glwasm_runtime_request_test_pause(runtime), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 0, nullptr, 0, &value), GLWASM_ERR_PAUSED);
+  int paused = 0;
+  EXPECT_EQ(glwasm_runtime_resume(runtime, &value, &paused), GLWASM_OK);
+  EXPECT_EQ(paused, 0);
+  EXPECT_EQ(value, 42u);
+  EXPECT_EQ(glwasm_runtime_test_fuel_used(runtime), module->funcs[0].nins);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimeExecutesLocalsAndDirectGuestCalls) {
+  static const char wat[] =
+      "(module (func (result i32) (i32.const 21)) "
+      "(func (export \"run\") (result i32) (local i32) "
+      "(local.set 0 (call 0)) (i32.add (local.get 0) (local.get 0))))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 1, nullptr, 0, &value), GLWASM_OK);
+  EXPECT_EQ(value, 42u);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimeExecutesGlobalAndIfElse) {
+  static const char wat[] =
+      "(module (global i32 (i32.const 40)) "
+      "(func (export \"run\") (result i32) "
+      "(if (result i32) (i32.const 1) "
+      "(then (i32.add (global.get 0) (i32.const 2))) "
+      "(else (i32.const 0)))))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 0, nullptr, 0, &value), GLWASM_OK);
+  EXPECT_EQ(value, 42u);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimeExecutesCallIndirect) {
+  static const char wat[] =
+      "(module (type (func (result i32))) (table 1 funcref) "
+      "(func (result i32) (i32.const 42)) "
+      "(func (export \"run\") (result i32) "
+      "(call_indirect (type 0) (i32.const 0))) "
+      "(elem (i32.const 0) func 0))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 1, nullptr, 0, &value), GLWASM_OK);
+  EXPECT_EQ(value, 42u);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, RuntimeMatchesStructuralIndirectTypesAndRecoversAfterTrap) {
+  static const char wat[] =
+      "(module (type $T (func (result i32))) "
+      "(type $U (func (result i32))) "
+      "(type $I64 (func (result i64))) (table 1 funcref) "
+      "(func (type $I64) (i64.const 9)) "
+      "(func (export \"bad\") (type $T) "
+      "(call_indirect (type $T) (i32.const 0))) "
+      "(func (export \"good\") (type $U) (i32.const 42)) "
+      "(elem (i32.const 0) func 0))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  uint64_t value = 0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 1, nullptr, 0, &value),
+            GLWASM_ERR_GUEST);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime),
+      GLWASM_TRAP_INDIRECT_CALL_TYPE_MISMATCH);
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 2, nullptr, 0, &value), GLWASM_OK);
+  EXPECT_EQ(value, 42u);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, WatTypeUseOffsetsLocalsPastParameters) {
+  static const char wat[] =
+      "(module (type $sig (func (param i32) (result i32))) "
+      "(func (export \"run\") (type $sig) (local $zero i32) "
+      "(local.get $zero)))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat),
+      sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  EXPECT_EQ(module->types[module->funcs[0].type_index].nparams, 1u);
+  EXPECT_EQ(module->funcs[0].type_index, 0u);
+  ASSERT_GE(module->ntypes, 1u);
+  EXPECT_EQ(module->funcs[0].ins[0].a, 1u);
+  GLWASM_Runtime *runtime = nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
+  const uint64_t arg=42;uint64_t value=0;
+  EXPECT_EQ(glwasm_runtime_invoke(runtime,0,&arg,1,&value),GLWASM_OK);
+  EXPECT_EQ(value,0u);
+  glwasm_runtime_destroy(runtime);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, TranslationResolvesIfElseAndLoopDestinations) {
+  static const char wat[] =
+      "(module (func (param i32) (result i32) "
+      "(block (loop (if (local.get 0) (then (br 1)) (else (br 0))))) "
+      "(i32.const 7)))";
+  GLWASM_Module * module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(
+      reinterpret_cast<const uint8_t *>(wat), sizeof(wat) - 1u, nullptr,
+      nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  const auto * translated = module->funcs[0].translated;
+  ASSERT_NE(translated, nullptr);
+  uint32_t if_index = UINT32_MAX;
+  uint32_t else_index = UINT32_MAX;
+  uint32_t loop_index = UINT32_MAX;
+  uint32_t outer_block_index = UINT32_MAX;
+  uint32_t branch_to_block = UINT32_MAX;
+  uint32_t branch_to_loop = UINT32_MAX;
+  uint32_t outer_block_end = UINT32_MAX;
+  for (uint32_t i = 0; i < translated->nins; ++i) {
+    switch (translated->ins[i].source.op) {
+      case 0x02: outer_block_index = i; break;
+      case 0x03: loop_index = i; break;
+      case 0x04: if_index = i; break;
+      case 0x05: else_index = i; break;
+      case 0x0c:
+        if (branch_to_block == UINT32_MAX) branch_to_block = i;
+        else branch_to_loop = i;
+        break;
+      default: break;
+    }
+  }
+  ASSERT_NE(if_index, UINT32_MAX);
+  ASSERT_NE(else_index, UINT32_MAX);
+  ASSERT_NE(loop_index, UINT32_MAX);
+  ASSERT_NE(outer_block_index, UINT32_MAX);
+  ASSERT_NE(branch_to_block, UINT32_MAX);
+  ASSERT_NE(branch_to_loop, UINT32_MAX);
+  uint32_t block_depth = 0;
+  for (uint32_t i = outer_block_index; i < translated->nins; ++i) {
+    const uint16_t op = translated->ins[i].source.op;
+    if (op == 0x02 || op == 0x03 || op == 0x04) ++block_depth;
+    else if (op == 0x0b && --block_depth == 0) {
+      outer_block_end = i;
+      break;
+    }
+  }
+  ASSERT_NE(outer_block_end, UINT32_MAX);
+  EXPECT_EQ(translated->ins[if_index].branch_target, else_index + 1u);
+  EXPECT_EQ(translated->ins[else_index].branch_target, UINT32_MAX);
+  EXPECT_EQ(translated->ins[branch_to_block].branch_target, loop_index + 1u);
+  EXPECT_GT(translated->ins[branch_to_loop].branch_target, else_index);
+  EXPECT_LT(translated->ins[branch_to_loop].branch_target,
+      translated->nins);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, TranslationResolvesDirectCallAndBranchTableTargets) {
+  static const char wat[] =
+      "(module (func (result i32) (i32.const 9)) "
+      "(func (param i32) (result i32) "
+      "(block (block (local.get 0) (br_table 0 1))) (i32.const 0)) "
+      "(func (result i32) (call 0)))";
+  GLWASM_Module * module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(
+      reinterpret_cast<const uint8_t *>(wat), sizeof(wat) - 1u, nullptr,
+      nullptr, &error, &module), GLWASM_OK)
+      << (error.message ? error.message : "");
+  const auto * table_fn = module->funcs[1].translated;
+  const auto * call_fn = module->funcs[2].translated;
+  ASSERT_NE(table_fn, nullptr);
+  ASSERT_NE(call_fn, nullptr);
+  uint32_t table_op = UINT32_MAX;
+  uint32_t call_op = UINT32_MAX;
+  for (uint32_t i = 0; i < table_fn->nins; ++i)
+    if (table_fn->ins[i].source.op == 0x0e) table_op = i;
+  for (uint32_t i = 0; i < call_fn->nins; ++i)
+    if (call_fn->ins[i].source.op == 0x10) call_op = i;
+  ASSERT_NE(table_op, UINT32_MAX);
+  ASSERT_NE(call_op, UINT32_MAX);
+  EXPECT_EQ(table_fn->branch_table_count, 2u);
+  const auto & branch = table_fn->ins[table_op];
+  ASSERT_LT(branch.alternate_target + 1u, table_fn->branch_table_count + 1u);
+  EXPECT_LT(table_fn->branch_table_targets[branch.alternate_target],
+      table_fn->branch_table_targets[branch.alternate_target + 1u]);
+  EXPECT_EQ(branch.branch_target,
+      table_fn->branch_table_targets[branch.alternate_target + 1u]);
+  EXPECT_EQ(call_fn->ins[call_op].call_target, 0u);
+  glwasm_module_destroy(module);
+}
+
 TEST(Decode, EmptyModule) {
   std::vector<uint8_t> bytes = hex(k_empty);
   GLWASM_Module * module = NULL;
@@ -451,6 +838,7 @@ TEST(Decode, ResultStringsCoverTheEnum) {
   }
   EXPECT_STREQ(glwasm_result_string(GLWASM_ERR_LIMIT), "Limit exceeded");
   EXPECT_STREQ(glwasm_result_string(GLWASM_ERR_VALIDATE), "Validation failed");
+  EXPECT_STREQ(glwasm_result_string(GLWASM_ERR_PAUSED), "Guest paused");
   EXPECT_STREQ(glwasm_result_string(GLWASM_RESULT_COUNT), "Unknown error");
   EXPECT_NE(glwasm_version_string(), nullptr);
   EXPECT_EQ(glwasm_version_number(), GLWASM_VERSION_NUMBER);

@@ -95,6 +95,9 @@ typedef struct GLWASM_Instr {
   uint32_t b;
   uint32_t d;
   uint64_t c;
+  /* Absolute byte offset in the original module (canonical lowered binary
+   * for WAT input). */
+  uint64_t source_offset;
 } GLWASM_Instr;
 
 typedef struct GLWASM_BlockType {
@@ -134,6 +137,7 @@ typedef struct GLWASM_Func {
   GLWASM_Catch * catches;
   uint32_t ncatches;
   uint32_t catch_cap;
+  struct GLWASM_TranslatedFunc * translated;
 } GLWASM_Func;
 
 typedef struct GLWASM_Table {
@@ -248,6 +252,27 @@ struct GLWASM_Module {
   GLWASM_Tag * tags;
   uint32_t ntags;
 };
+
+typedef struct GLWASM_TranslatedInstr {
+  GLWASM_Instr source;
+  uint32_t branch_target;
+  uint32_t alternate_target;
+  uint32_t call_target;
+} GLWASM_TranslatedInstr;
+
+typedef struct GLWASM_TranslatedFunc {
+  GLWASM_TranslatedInstr * ins;
+  uint32_t nins;
+  uint64_t * offsets;
+  uint32_t offset_count;
+  uint32_t * branch_table_targets;
+  uint32_t branch_table_count;
+} GLWASM_TranslatedFunc;
+
+GLWASM_Result glwasm_translate_module(GLWASM_Module * module);
+uint8_t glwasm_opcode_cost(uint16_t opcode);
+void glwasm_translate_func_destroy(GLWASM_Module * module,
+    GLWASM_TranslatedFunc * translated);
 
 /**
  * @brief Validate a module that has already decoded.

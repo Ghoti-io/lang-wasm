@@ -1,5 +1,5 @@
 Name: Ghoti.io Lang-wasm(BRANCH)
-Description: A WebAssembly 3.0 binary decoder and validator.
+Description: A WebAssembly 3.0 decoder, validator, translator and interpreter.
 Version: (VERSION)
 URL: https://github.com/Ghoti-io/lang-wasm
 Libs: -L(PC_LIB_DIR) -l(SUITE)-(PROJECT)(BRANCH)

@@ -50,6 +50,10 @@ const char * glwasm_result_string(GLWASM_Result result) {
       return "Internal error";
     case GLWASM_ERR_VALIDATE:
       return "Validation failed";
+    case GLWASM_ERR_GUEST:
+      return "Guest execution trapped";
+    case GLWASM_ERR_PAUSED:
+      return "Guest paused";
     case GLWASM_RESULT_COUNT:
     default:
       return "Unknown error";

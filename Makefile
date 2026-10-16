@@ -48,6 +48,8 @@ WASM_SPEC_DIR ?= ../runtime-jit/third_party/wasm-spec/$(WASM_SPEC_COMMIT)
 export GLWASM_WAST_CORPUS_ROOT := $(abspath $(WASM_SPEC_DIR)/test)
 export GLWASM_WAST_CLASSIFICATION := $(abspath tests/data-wast-classification.tsv)
 export GLWASM_WAST_ASSERTION_SKIPS := $(abspath tests/data-wast-assertion-skips.tsv)
+export GLWASM_WAST_EXECUTION_BASELINE := $(abspath tests/data-wast-execution-baseline.tsv)
+export GLWASM_WAST_SPEC_COMMIT := $(WASM_SPEC_COMMIT)
 
 UNAME_S := $(shell uname -s)
 
@@ -134,9 +136,9 @@ endif
 PKG_CONFIG_LOOKUP_PATH := $(if $(PKG_CONFIG_PATH_ENV),$(PKG_CONFIG_PATH_ENV):)$(PC_INSTALL_PATH)
 
 CXX := g++
-CXXFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c++20 -O1 -g $(EXTRA_CXXFLAGS)
+CXXFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wno-error=unused-function -Wfatal-errors -std=c++20 -O1 -g -ffp-contract=off $(EXTRA_CXXFLAGS)
 CC := cc
-CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wfloat-conversion -fstrict-aliasing -Wstrict-aliasing=1 -Wno-error=unused-function -Wfatal-errors -std=c17 $(OPT_CFLAGS) -g $(EXTRA_CFLAGS)
+CFLAGS := -pedantic-errors -Wall -Wextra -Werror -Wfloat-conversion -fstrict-aliasing -Wstrict-aliasing=1 -Wno-error=unused-function -Wfatal-errors -std=c17 $(OPT_CFLAGS) -g -ffp-contract=off $(EXTRA_CFLAGS)
 ifeq ($(OS_NAME), Windows)
 CFLAGS += -DGLWASM_STATIC
 CXXFLAGS += -DGLWASM_STATIC
@@ -168,6 +170,7 @@ SKIP_DEP_CHECK := 1
 endif
 
 CUTIL_PC ?= ghoti.io-cutil$(BRANCH)
+RCORE_PC ?= ghoti.io-runtime-core$(BRANCH)
 CUTIL_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(CUTIL_PC) 2>/dev/null)
 CUTIL_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(CUTIL_PC) 2>/dev/null)
 CUTIL_LIBDIR := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs-only-L $(CUTIL_PC) 2>/dev/null | awk '{print $$1}' | sed 's/^-L//')
@@ -177,17 +180,27 @@ $(error ghoti.io-cutil was not found by pkg-config. Run ./bootstrap.sh at the ro
 endif
 endif
 INCLUDE += $(CUTIL_CFLAGS)
+RCORE_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(RCORE_PC) 2>/dev/null)
+RCORE_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(RCORE_PC) 2>/dev/null)
+RCORE_EXISTS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --exists $(RCORE_PC) 2>/dev/null && echo yes)
+RCORE_LIBDIR := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs-only-L $(RCORE_PC) 2>/dev/null | awk '{print $$1}' | sed 's/^-L//')
+ifneq ($(RCORE_EXISTS),yes)
+ifndef SKIP_DEP_CHECK
+$(error ghoti.io-runtime-core was not found by pkg-config. Install runtime-core into the same PREFIX and set PKG_CONFIG_PATH. There is deliberately no sibling-checkout fallback.)
+endif
+endif
+INCLUDE += $(RCORE_CFLAGS)
 
 SOURCES := $(shell find src -type f -name '*.c')
 LIBOBJECTS := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cflags gtest`
 
-TEST_GATES ?= check-symbols check-aliasing check-stamps check-labels check-edges check-wast-corpus fuzz-replay
+TEST_GATES ?= check-symbols check-aliasing check-stamps check-fp-contract check-labels check-edges check-wast-corpus fuzz-replay
 
 VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible --track-origins=yes --error-exitcode=1 --suppressions=tests/valgrind.supp
 
-WASMLIBRARY := -Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-archive $(CUTIL_LIBS)
+WASMLIBRARY := -Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-archive $(RCORE_LIBS) $(CUTIL_LIBS)
 
 ifeq ($(OS_NAME), Windows)
 TEST_LDFLAGS := -Wl,--wrap=__mingw_fprintf
@@ -201,7 +214,7 @@ TEST_SOURCES := $(foreach pair,$(TEST_PAIRS),$(word 1,$(subst |, ,$(pair))))
 TEST_NAMES := $(foreach pair,$(TEST_PAIRS),$(word 2,$(subst |, ,$(pair))))
 TEST_EXECUTABLES := $(addprefix $(APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(TEST_NAMES)))
 
-TEST_LD_PATH := $(APP_DIR):$(CUTIL_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)
+TEST_LD_PATH := $(APP_DIR):$(RCORE_LIBDIR):$(CUTIL_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)
 
 all: $(APP_DIR)/$(TARGET) $(APP_DIR)/$(STATIC_TARGET) ## Build shared + static libraries
 
@@ -246,7 +259,7 @@ $(OBJ_DIR)/%.o: src/%.c $(FLAGS_STAMP) | $(LIBVER_GEN)
 
 $(APP_DIR)/$(TARGET): $(LIBOBJECTS)
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -shared -o $@ $^ $(LDFLAGS) $(CUTIL_LIBS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)
+	$(CXX) $(CXXFLAGS) -shared -o $@ $^ $(LDFLAGS) $(RCORE_LIBS) $(CUTIL_LIBS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)
 ifeq ($(OS_NAME), Linux)
 	@ln -f -s $(TARGET) $(APP_DIR)/$(SO_NAME)
 	@ln -f -s $(SO_NAME) $(APP_DIR)/$(BASE_NAME)
@@ -272,11 +285,11 @@ endef
 $(foreach pair,$(TEST_PAIRS),\
 	$(eval $(call test-executable-rule,$(word 1,$(subst |, ,$(pair))),$(word 2,$(subst |, ,$(pair))))))
 
-.PHONY: clean cloc docs docs-pdf coverage check-symbols check-stamps check-aliasing check-labels check-edges check-wast-corpus
+.PHONY: clean cloc docs docs-pdf coverage check-symbols check-stamps check-fp-contract check-aliasing check-labels check-edges check-wast-corpus
 .PHONY: all install test test-quiet test-asan test-valgrind uninstall
 .PHONY: fuzz fuzz-clean fuzz-replay help
 
-TEST_LD_PATH := $(APP_DIR):$(CUTIL_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)
+TEST_LD_PATH := $(APP_DIR):$(RCORE_LIBDIR):$(CUTIL_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)
 
 check-aliasing: ## Fail if -Wstrict-aliasing is not armed at level 1
 	@mkdir -p $(BUILD_DIR)
@@ -309,6 +322,9 @@ check-aliasing: ## Fail if -Wstrict-aliasing is not armed at level 1
 
 check-stamps: ## Fail if a compile rule names no flags stamp, or a stamp omits a variable
 	@python3 tools/check-stamps.py
+
+check-fp-contract: ## Fail if any guest-float compile flags permit contraction
+	@tools/check-fp-contract.sh
 
 check-symbols: $(APP_DIR)/$(TARGET) ## Fail if any exported symbol lacks the version namespace
 	@tools/check-symbols.sh $(APP_DIR)/$(TARGET) $(LIBVER_SYMBOL) .
@@ -364,7 +380,7 @@ ASAN_DEPFILES := $(ASAN_LIBOBJECTS:.o=.d) \
     $(foreach pair,$(TEST_PAIRS),$(ASAN_OBJ_DIR)/tests/$(basename $(notdir $(word 1,$(subst |, ,$(pair))))).d)
 -include $(ASAN_DEPFILES)
 ASAN_ARCHIVE := $(ASAN_APP_DIR)/$(STATIC_TARGET)
-ASAN_WASMLIBRARY := -Wl,--whole-archive $(ASAN_ARCHIVE) -Wl,--no-whole-archive $(CUTIL_LIBS)
+ASAN_WASMLIBRARY := -Wl,--whole-archive $(ASAN_ARCHIVE) -Wl,--no-whole-archive $(RCORE_LIBS) $(CUTIL_LIBS)
 ASAN_CFLAGS := $(CFLAGS) $(ASAN_UBSAN_FLAGS) -DGLWASM_BUILD
 ASAN_CXXFLAGS := $(CXXFLAGS) $(ASAN_UBSAN_FLAGS)
 ASAN_LDFLAGS := $(LDFLAGS) $(ASAN_UBSAN_FLAGS)
@@ -415,7 +431,7 @@ test-asan: $(ASAN_TEST_EXECUTABLES) ## Build with ASan+UBSan and run the tests
 FUZZ_CC ?= clang
 FUZZ_CXX ?= clang++
 FUZZ_CC_OK := $(shell which $(FUZZ_CC) 2>/dev/null)
-FUZZ_SAN := -fsanitize=address,$(UBSAN_CHECKS) -fno-omit-frame-pointer -g -O1 -fstrict-aliasing
+FUZZ_SAN := -fsanitize=address,$(UBSAN_CHECKS) -fno-omit-frame-pointer -g -O1 -fstrict-aliasing -ffp-contract=off
 FUZZ_LIB_FLAGS := $(FUZZ_SAN) -fsanitize=fuzzer-no-link
 FUZZ_BIN_FLAGS := $(FUZZ_SAN) -fsanitize=fuzzer
 FUZZ_DIR := $(BUILD_DIR)/fuzz
@@ -440,7 +456,7 @@ $$(FUZZ_APP_DIR)/fuzz_$2: tests/fuzz/fuzz_$2.c $$(FUZZ_OBJECTS) $$(FUZZ_FLAGS_ST
 	fi
 	@mkdir -p $$(@D) $$(FUZZ_CORPUS)/$2
 	$$(FUZZ_CC) $$(FUZZ_BIN_FLAGS) -std=c17 $(INCLUDE) \
-		-o $$@ $$< $$(FUZZ_OBJECTS) $(CUTIL_LIBS)
+		-o $$@ $$< $$(FUZZ_OBJECTS) $(RCORE_LIBS) $(CUTIL_LIBS) -lm
 
 fuzz-run-$2: $$(FUZZ_APP_DIR)/fuzz_$2 ## Run the $2 fuzzer for $$(FUZZ_TIME) seconds
 	@mkdir -p $$(FUZZ_CORPUS)/$2
@@ -461,7 +477,7 @@ endif
 $(APP_DIR)/fuzz/replay_%: tests/fuzz/fuzz_%.c tests/fuzz/replay_main.c \
 		$(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(LIBVER_GEN)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(INCLUDE) -o $@ tests/fuzz/fuzz_$*.c tests/fuzz/replay_main.c $(LDFLAGS) $(WASMLIBRARY)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ tests/fuzz/fuzz_$*.c tests/fuzz/replay_main.c $(LDFLAGS) $(WASMLIBRARY) -lm
 
 fuzz-replay: $(APP_DIR)/fuzz/replay_decode $(APP_DIR)/fuzz/replay_validate ## Replay the seed corpus
 	@files=$$(find tests/fuzz/corpus -type f | sort); \
@@ -480,7 +496,7 @@ fuzz-clean: ## Remove the fuzz build
 ####################################################################
 
 LDCONF_INSTALL_PATH ?= /etc/ld.so.conf.d
-PC_REQUIRES := $(CUTIL_PC)
+PC_REQUIRES := $(CUTIL_PC), $(RCORE_PC)
 PKGCONFIG_INSTALL_PATH ?= $(PC_INSTALL_PATH)
 
 install: all ## Install the library
@@ -560,15 +576,15 @@ help: ## Display this help
 
 $(FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(CC) $(CXX) $(LIB_CFLAGS) $(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE) $(WASMLIBRARY) $(CUTIL_LIBS) $(TESTFLAGS) $(TEST_LDFLAGS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(LIB_CFLAGS) $(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE) $(WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(TESTFLAGS) $(TEST_LDFLAGS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(ASAN_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(ASAN_WASMLIBRARY) $(CUTIL_LIBS) $(TESTFLAGS)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(ASAN_WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(TESTFLAGS)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(FUZZ_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(INCLUDE) $(CUTIL_LIBS) $(FUZZ_SAN)' > $@.new
+	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(INCLUDE) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(FUZZ_SAN)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@

@@ -5,6 +5,7 @@
 #include <ghoti.io/lang-wasm/parse.h>
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
@@ -889,6 +890,25 @@ static const GLWASM_Text*explicit_type_body(const GLWASM_Text*root,size_t first,
   }
   return NULL;
 }
+static int resolve_type(const GLWASM_Text*n,const NameRef*refs,size_t count,
+    uint32_t*out);
+static uint32_t signature_param_count(const GLWASM_Text*sig){
+  uint32_t n=0;
+  for(size_t i=1;sig&&i<glwasm_text_size(sig);i++)if(atom(at(at(sig,i),0),"param"))
+    for(size_t j=1;j<glwasm_text_size(at(sig,i));j++){
+      if(named_atom(at(at(sig,i),j)))j++;
+      if(j<glwasm_text_size(at(sig,i)))n++;
+    }
+  return n;
+}
+static uint32_t type_use_param_count(const GLWASM_Text*root,size_t first,
+    const GLWASM_Text*type_use_node,const NameRef*typenames,size_t ntypenames){
+  uint32_t type_index;
+  if(!resolve_type(at(type_use_node,1),typenames,ntypenames,&type_index))
+    return 0;
+  const GLWASM_Text*decl=explicit_type_body(root,first,type_index);
+  return signature_param_count(decl);
+}
 static int explicit_signature_index(const GLWASM_Text*root,size_t first,
     const GLWASM_Text*function,uint32_t*out){
   uint32_t index=0;
@@ -1678,6 +1698,7 @@ unsupported_import:
       }
       uint32_t typeix;
       if(tu){if(glwasm_text_size(tu)!=2||!resolve_type(at(tu,1),typenames,ntyperefs,&typeix)){if(e){e->result=GLWASM_ERR_UNSUPPORTED;e->location=glwasm_text_location(tu);e->message="function type use must resolve to a declared type";}free(body.p);free(params.p);free(results.p);free(locals.p);r=GLWASM_ERR_UNSUPPORTED;goto done;}
+        if(nparams==0){uint32_t offset=type_use_param_count(root,first_field,tu,typenames,ntyperefs);for(size_t q=0;q<nlocalrefs;q++)localrefs[q].index+=offset;}
         if(nparams||nresults){const GLWASM_Text*decl=explicit_type_body(root,first_field,typeix);if(decl&&!same_signature(f,decl)){malformed_error(e,tu,"inline function type does not match type use");free(body.p);free(params.p);free(results.p);free(locals.p);r=GLWASM_ERR_CORRUPT;goto done;}}
       }
       else if(!function_type_index(root,first_field,ntypefields,f,&typeix)){
@@ -1851,6 +1872,7 @@ unsupported_import:
       }
       free(enc.p);free(localvec.p);free(body.p);free(locals.p);
       free(localrefs);localrefs=NULL;nlocalrefs=0;
+      fi++;
     }
     for(size_t i=0;i<ntagdefs+ntagimports;i++)if(taginfos[i].type_index>=ntypefields+nimplicit&&
         !emit_tag_signature(&types,taginfos[i].node,e)){r=e&&e->result?e->result:GLWASM_ERR_UNSUPPORTED;goto done;}

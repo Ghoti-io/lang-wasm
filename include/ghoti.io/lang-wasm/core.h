@@ -41,10 +41,9 @@ extern "C" {
  * Zero is success. ::GLWASM_RESULT_COUNT closes the enum so a test can check
  * the string table is complete.
  *
- * The nine shared constants keep the numbers they have in every other
- * library. ::GLWASM_ERR_VALIDATE is appended before the count: a module that
- * is Wasm and fails a rule is not a bad caller argument and not corrupt
- * bytes. See CONVENTIONS.md section 13.
+ * The established shared result values retain their numeric assignments.
+ * Validation, guest-trap, and paused outcomes are appended before the count
+ * so they remain distinct from malformed input and caller errors.
  */
 typedef enum {
   GLWASM_OK = 0,           ///< The operation succeeded.
@@ -59,6 +58,8 @@ typedef enum {
   GLWASM_ERR_INVALID,      ///< A caller-supplied argument is wrong.
   GLWASM_ERR_INTERNAL,     ///< The library's own invariant failed.
   GLWASM_ERR_VALIDATE,     ///< The bytes are Wasm, and they break a rule.
+  GLWASM_ERR_GUEST,        ///< Guest execution trapped.
+  GLWASM_ERR_PAUSED,       ///< Guest execution paused and can be resumed.
   GLWASM_RESULT_COUNT
 } GLWASM_Result;
 

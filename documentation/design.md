@@ -1,7 +1,10 @@
 # Design
 
-`lang-wasm` decodes a WebAssembly 3.0 binary and then validates it. It does
-not instantiate a module, resolve an import, or run an instruction.
+**Status:** Story 3 translator and interpreter core are implemented; the
+acceptance gates and review are in progress.
+
+`lang-wasm` decodes a WebAssembly 3.0 binary, validates it, then translates
+validated functions for execution on runtime-core.
 
 ## Two passes
 
@@ -177,7 +180,8 @@ values while leaving execution to the runtime adapter. `glwasm_wat_module_parse`
 lowers a currently narrow function
 subset (function imports, numeric params/results including multi-value results,
 explicit named/numeric function types and type uses, exports, folded numeric
-operations, linear integer/floating constants, scalar numeric operators,
+operations, linear integer/floating constants, selected scalar numeric
+operators,
 numeric and named locals, function/table/memory/global imports, start functions, direct
 and indirect calls, reference null/function instructions, table get/set, numeric
 branch tables, basic block/loop/if control, defined tables/memories including
@@ -189,7 +193,7 @@ binary sections, then reuses the decoder and validator. The lowering rejects
 unsupported module fields and instructions explicitly. It does not yet cover
 the in-scope WAT grammar; generated-binary validation errors currently point
 to the module form, while syntax/lowering errors point to their source form.
-Assertion execution remains pending for the interpreter adapter.
+Supported return and trap assertions execute through the Story 3 interpreter adapter; unsupported value forms remain pending explicitly.
 
 ## Pinned WAST corpus gate
 
@@ -205,5 +209,64 @@ module commands or assertions are listed in
 `tests/data-wast-assertion-skips.tsv` and are counted by reason.
 `make test` checks the exact fetched file set, all digests and the exhaustive
 classification before it parses the corpus through the public WAST command
-parser. Assertion execution is reported as pending and is not counted as a
-pass until the interpreter adapter is added.
+parser. Supported execution assertions are counted only after the runtime
+adapter executes them; unsupported later-story instructions remain explicitly
+pending.
+
+## Translation and source locations
+
+The decoder records the absolute module byte offset before consuming every
+instruction opcode. This is the canonical lowered binary's coordinate space
+for text modules, so binary and WAT-built modules share one convention. After
+validation, translation copies each function's instructions into module-owned
+storage, pairs every structured opener with its matching `end` and optional
+`else`, and resolves each branch depth to an instruction boundary. Loop
+branches target the first instruction in the loop body; block and function
+branches target the first instruction after the matching `end`. `br_table`
+destinations are stored in a per-function side array. A parallel offset array
+maps every translated position, plus its synthetic terminal boundary, to a
+nondecreasing in-range opcode byte offset.
+
+## Runtime and fuel
+
+The internal Story 3 interpreter runs as one runtime-core engine activation
+with guest calls represented by persistent guest-stack frames. The dispatch
+loop is non-recursive in C, reacquires frame slots after operations that may
+move the stack, and replaces the active frame for tail calls. It currently
+executes scalar numeric operations, locals, globals, structured control flow,
+direct calls, indirect calls through initialized function tables, and tail
+calls. Active element segments support both function-index and reference
+expressions for `ref.func` and `ref.null`.
+
+The engine polls at function entry and loop back-edges and charges one fuel
+unit per executed opcode from `glwasm_opcode_cost`. Guest traps return
+`GLWASM_ERR_GUEST`; the runtime retains distinct kinds for unreachable,
+integer divide-by-zero/overflow, table bounds, uninitialized elements, and
+indirect-call type mismatch. Pause/resume, fuel accounting, guest-depth
+limits, and always-move stack behavior have focused regression tests.
+The current test-only fuel/depth override installs a fresh runtime-core
+context after instantiation, so start-function fuel is not charged to a later
+test invocation's budget. The corpus preflight also conservatively follows
+every active target in the table selected by `call_indirect`; an unsupported
+target can defer an assertion even when its test input cannot select that
+table slot. Eligibility scans each reachable function's entire instruction
+body, including statically unreachable instructions, so an unsupported opcode
+in dead code can also defer that assertion. Active element expressions other
+than one `ref.func` or `ref.null` are rejected as unsupported during runtime
+creation and counted as deferred by the corpus harness. The internal runtime
+borrows its module, which must outlive the runtime.
+
+The current WAST executor covers i32 `eqz` and comparisons plus selected integer
+arithmetic/bitwise operators, selected i64 arithmetic/bitwise operators,
+f32/f64 arithmetic, locals/globals, structured branches including `br_table`,
+direct and indirect calls, tail calls, module start functions, and active
+table initialization with one `ref.func` or `ref.null` per element. Table
+growth and general table operations are not implemented. Runtime traps cover
+`unreachable`, i32 division by zero or overflow, table bounds,
+uninitialized elements, and indirect-call type mismatch. Other MVP
+numeric operators and conversions, unsupported multi-result/value forms, and
+later-story instructions remain pending; they are not counted as passes.
+The harness executes supported `assert_return` and `assert_trap` commands. Integer values are type-checked, finite f32/f64 results compare bit-exactly, and canonical, arithmetic, and payload NaN forms use their corresponding WAST matching rules. Executed assertions fail on mismatches or unexpected traps. It is a test-only internal adapter,
+not the future public embedder/import API. Memories, full table operations,
+multi-value execution, exceptions, and general host imports remain later
+work.

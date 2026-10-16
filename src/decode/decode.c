@@ -48,6 +48,7 @@ enum {
 
 typedef struct Reader {
   const uint8_t * p;
+  const uint8_t * base;
   const uint8_t * end;
   GLWASM_Result err;
   const char * limit;
@@ -829,6 +830,7 @@ static int read_instr(Reader * r, GLWASM_Func * fn, int * depth,
   GLWASM_Instr ins;
 
   memset(&ins, 0, sizeof(ins));
+  ins.source_offset = (uint64_t)(r->p - r->base);
   if (!read_byte(r, &op)) {
     return 0;
   }
@@ -1253,6 +1255,7 @@ static int read_code_entry(Reader * r, GLWASM_Func * fn,
 }
 
 static void free_func(GLWASM_Module * m, GLWASM_Func * fn) {
+  glwasm_translate_func_destroy(m, fn->translated);
   mod_free(m, fn->locals);
   mod_free(m, fn->ins);
   mod_free(m, fn->u32s);
@@ -2248,6 +2251,7 @@ GLWASM_Result glwasm_module_decode(
   module->limits = *limits;
   memset(&r, 0, sizeof(r));
   r.p = bytes;
+  r.base = bytes;
   r.end = bytes + length;
   r.limits = limits;
   r.alloc = alloc;
@@ -2273,6 +2277,14 @@ GLWASM_Result glwasm_module_decode(
       glwasm_module_destroy(module);
       write_failure(failure, verr, vlimit);
       return verr;
+    }
+  }
+  {
+    GLWASM_Result tr = glwasm_translate_module(module);
+    if (tr != GLWASM_OK) {
+      glwasm_module_destroy(module);
+      write_failure(failure, tr, NULL);
+      return tr;
     }
   }
   *out_module = module;

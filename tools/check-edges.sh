@@ -2,7 +2,7 @@
 #
 # Fail on a dependency edge the spine forbids, in either place it can hide.
 #
-# lang-wasm depends on cutil and nothing else. The rule is checked twice
+# lang-wasm depends on cutil and runtime-core. The rule is checked twice
 # because the two checks see different things: a clean #include list can be
 # right while the shared object still links a forbidden library, and an
 # #include can be forbidden while the link line is clean.
@@ -24,7 +24,7 @@ set -eu
 mode="${1:?usage: check-edges.sh --includes <root> | --links <dir>}"
 target="${2:?usage: check-edges.sh --includes <root> | --links <dir>}"
 
-ALLOWED='cutil|lang-wasm'
+ALLOWED='cutil|runtime-core|lang-wasm'
 # What may follow an allowed name in a NEEDED entry: the BRANCH suffix of a
 # build that named one (cutil-dev). A different library whose name merely
 # begins with an allowed one (cutil-extra) is an edge, and is no longer
@@ -74,7 +74,7 @@ HITS
     if [ "$status" -ne 0 ]; then
       exit 1
     fi
-    printf 'check-edges: %d source files, every #include of another Ghoti library is cutil\n' \
+      printf 'check-edges: %d source files, every Ghoti include is an allowed dependency\n' \
       "$count"
     ;;
 
@@ -135,7 +135,7 @@ HITS
     if [ "$status" -ne 0 ]; then
       exit 1
     fi
-    printf 'check-edges: %d shared objects, every Ghoti library they link is cutil\n' \
+      printf 'check-edges: %d shared objects, every Ghoti dependency is allowed\n' \
       "$count"
     ;;
 

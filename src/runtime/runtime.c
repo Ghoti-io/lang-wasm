@@ -4,7 +4,6 @@
  */
 #include <ghoti.io/lang-wasm/macros.h>
 #include <ghoti.io/runtime-core/a/boundary.h>
-#include <ghoti.io/runtime-core/b/roots.h>
 #include <ghoti.io/cutil/allocator.h>
 #include "runtime.h"
 #include <math.h>
@@ -91,7 +90,6 @@ struct GLWASM_Runtime {
   const GCU_Allocator *guest_alloc;
   GRCORE_Group *group; GRCORE_Options *options;
   GRCORE_Context *context; GRCORE_EngineId engine; uintptr_t boundary_token; Run run;
-  GRCORE_Context *root_context;
   ExceptionValue *exceptions;
   GRCORE_Context *boundary_context;
   GRCORE_EngineId boundary_engine;
@@ -104,7 +102,6 @@ struct GLWASM_Runtime {
   GRCORE_BoundaryRef nested_boundary;
   int nested_active;
   int nested_owns_run;
-  int nested_root_added;
 };
 
 static atomic_uintptr_t next_boundary_token=1;
@@ -125,48 +122,6 @@ struct GLWASM_Snapshot {
   uint64_t bulk_dst,bulk_src,bulk_len,bulk_done,bulk_value;
   int bulk_active;
 };
-
-static void enumerate_exception_roots(GRCORE_Context *context, void *value,
-    const GRCORE_RootVisitor *visitor) {
-  GLWASM_Runtime *runtime=(GLWASM_Runtime *)value;
-  (void)context;
-  if(!runtime||!visitor||!visitor->slot)return;
-  for(ExceptionValue *exception=runtime->exceptions;exception;
-      exception=exception->next) {
-    if(exception->tag>=runtime->module->ntags)continue;
-    uint32_t type_index=runtime->module->tags[exception->tag].type_index;
-    if(type_index>=runtime->module->ntypes)continue;
-    GLWASM_TypeDef *type=&runtime->module->types[type_index];
-    uint32_t count=exception->payload_count<type->nparams
-        ?exception->payload_count:type->nparams;
-    for(uint32_t i=0;i<count;i++) {
-      GLWASM_ValType t=type->params[i];
-      if(t.kind==GLWASM_VK_REF&&t.heap!=GLWASM_HT_FUNC&&
-          t.heap!=GLWASM_HT_NOFUNC)
-        visitor->slot(visitor->user,&exception->payload[i]);
-    }
-  }
-}
-
-static const GRCORE_RootSource exception_root_source=
-    GRCORE_ROOT_SOURCE_INIT("lang-wasm exceptions",enumerate_exception_roots);
-
-static GRCORE_Result ensure_exception_root_source(GRCORE_Context *context,
-    GLWASM_Runtime *runtime,int *out_added) {
-  size_t count=grcore_context_root_source_count(context);
-  for(size_t i=0;i<count;i++){
-    const GRCORE_RootSource *source=NULL;void *value=NULL;
-    if(grcore_context_root_source(context,i,&source,&value)==GRCORE_OK&&
-        source==&exception_root_source&&value==runtime){
-      if(out_added)*out_added=0;
-      return GRCORE_OK;
-    }
-  }
-  GRCORE_Result result=grcore_context_add_root_source(context,
-      &exception_root_source,runtime);
-  if(result==GRCORE_OK&&out_added)*out_added=1;
-  return result;
-}
 
 static void free_exceptions(GLWASM_Runtime *runtime) {
   ExceptionValue *exception=runtime?runtime->exceptions:NULL;
@@ -1452,10 +1407,7 @@ static GLWASM_Result runtime_create_impl(GLWASM_Module*m,
     .data_dropped=r->data_dropped,.elements_dropped=r->elements_dropped,
     .guest_alloc=r->guest_alloc};
   core_result=grcore_context_register(r->context,&trap_key,&r->run);
-  if(core_result==GRCORE_OK)
-    core_result=ensure_exception_root_source(r->context,r,NULL);
   if(core_result!=GRCORE_OK){GLWASM_Result result=map_core_result(core_result);glwasm_runtime_destroy(r);return result;}
-  r->root_context=r->context;
   if(m->has_start){uint64_t ignored=0;GLWASM_Result started=glwasm_runtime_invoke(r,m->start,NULL,0,&ignored);if(started!=GLWASM_OK){glwasm_runtime_destroy(r);return started;}}
   *out=r;return GLWASM_OK;
 }
@@ -1510,11 +1462,6 @@ static GLWASM_Result finish_nested(GLWASM_Runtime *runtime,GRCORE_Result core,
     runtime->run.paused=1;
     return GLWASM_ERR_PAUSED;
   }
-  if(runtime->nested_root_added){
-    (void)grcore_context_remove_root_source(runtime->nested_context,
-        &exception_root_source,runtime);
-    runtime->nested_root_added=0;
-  }
   GRCORE_Stack *stack=grcore_context_stack(runtime->nested_context);
   while(grcore_stack_frame_count(stack)>runtime->nested_base)
     (void)grcore_stack_pop(stack);
@@ -1568,25 +1515,17 @@ GLWASM_Result glwasm_runtime_invoke_nested(GLWASM_Runtime *runtime,
     if(core!=GRCORE_OK)return map_core_result(core);
     runtime->boundary_context=context;runtime->boundary_engine=wasm_engine;
   }
-  int root_added=0;
-  core=ensure_exception_root_source(context,runtime,&root_added);
-  if(core!=GRCORE_OK)return map_core_result(core);
   GRCORE_Stack *stack=grcore_context_stack(context);
   size_t base=grcore_stack_frame_count(stack);
   GRCORE_BoundaryRef boundary={0};
   core=grcore_boundary_enter(stack,caller,wasm_engine,instance_token,true,
       &boundary);
-  if(core!=GRCORE_OK){
-    if(root_added)(void)grcore_context_remove_root_source(context,
-        &exception_root_source,runtime);
-    return map_core_result(core);
-  }
+  if(core!=GRCORE_OK)return map_core_result(core);
   runtime->nested_saved_run=runtime->run;
   runtime->nested_saved_token=runtime->boundary_token;
   runtime->nested_context=context;runtime->nested_caller=caller;
   runtime->nested_instance=instance_token;runtime->nested_base=base;
   runtime->nested_boundary=boundary;
-  runtime->nested_root_added=root_added;
   Run *run=&runtime->run;
   run->ctx=context;run->engine=wasm_engine;run->instance=runtime;
   run->entry=function;run->nargs=argument_count;run->stack_base=base;
@@ -1702,7 +1641,6 @@ GLWASM_Result glwasm_runtime_set_test_limits(GLWASM_Runtime *r,
   if (cr == GRCORE_OK) cr = grcore_context_create(r->group, options, &context);
   if (cr == GRCORE_OK) cr = grcore_engine_register(context, &descriptor, &engine);
   if (cr == GRCORE_OK) cr = grcore_context_register(context, &trap_key, &r->run);
-  if (cr == GRCORE_OK) cr = ensure_exception_root_source(context,r,NULL);
   if (cr == GRCORE_OK)
     cr = grcore_stack_set_always_move(grcore_context_stack(context), always_move != 0);
   if (cr != GRCORE_OK) {
@@ -1795,7 +1733,6 @@ GLWASM_Result glwasm_runtime_set_test_limits(GLWASM_Runtime *r,
   if (r->context) grcore_context_destroy(r->context);
   if (r->options) grcore_options_destroy(r->options);
   r->context = context;
-  r->root_context = context;
   r->options = options;
   r->engine = engine;
   r->guest_alloc = new_alloc;

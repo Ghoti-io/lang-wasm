@@ -152,7 +152,36 @@ static GLWASM_Result translate_func(GLWASM_Module * module,
       target->call_target = source->a;
     }
 
-    if (is_open(source->op)) {
+    if (is_open(source->op) && source->op != 0x1f) {
+      active[depth++] = i + 1u;
+    }
+
+    if (source->op == 0x1f) {
+      uint32_t j;
+      if (source->b > function->ncatches ||
+          source->d > function->ncatches - source->b) {
+        translated_free(module, translated);
+        gcu_allocator_free(&module->alloc, labels);
+        gcu_allocator_free(&module->alloc, active);
+        return GLWASM_ERR_INTERNAL;
+      }
+      for (j = 0; j < source->d; ++j) {
+        GLWASM_Catch * clause = &function->catches[source->b + j];
+        uint32_t label_index;
+        if (clause->label >= depth) {
+          translated_free(module, translated);
+          gcu_allocator_free(&module->alloc, labels);
+          gcu_allocator_free(&module->alloc, active);
+          return GLWASM_ERR_INTERNAL;
+        }
+        label_index = active[depth - 1u - clause->label];
+        clause->target_pc = label_destination(&labels[label_index]);
+        clause->target_opener = label_index == 0
+            ? UINT32_MAX : labels[label_index].opener;
+        clause->resolved = 1;
+      }
+      /* Clause labels are relative to the enclosing labels. The try_table's
+       * own result label is not a legal catch target. */
       active[depth++] = i + 1u;
     }
 

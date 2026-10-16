@@ -114,6 +114,10 @@ typedef struct GLWASM_Catch {
   uint8_t kind; /* 0 catch, 1 catch_ref, 2 catch_all, 3 catch_all_ref */
   uint32_t tag;
   uint32_t label;
+  /* Resolved by translate.c. The function label has no opener. */
+  uint32_t target_pc;
+  uint32_t target_opener;
+  uint8_t resolved;
 } GLWASM_Catch;
 
 typedef struct GLWASM_Func {

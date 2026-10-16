@@ -369,7 +369,7 @@ bool trap_message_matches(GLWASM_RuntimeTrap trap,const std::string &expected) {
 bool instruction_supported(uint16_t op) {
   if(op==0x00||op==0x01||(op>=0x02&&op<=0x05)||(op>=0x0b&&op<=0x0e)||
      (op>=0x0f&&op<=0x13)||op==0x1a||op==0x1b||
-     (op>=0x20&&op<=0x24)||op==0x41||op==0x42||op==0x43||op==0x44||
+     (op>=0x20&&op<=0x24)||op==0x08||op==0x0a||op==0x1f||op==0x41||op==0x42||op==0x43||op==0x44||
      (op>=0x45&&op<=0x4f)||(op>=0x92&&op<=0x98)||(op>=0xa0&&op<=0xa6))return true;
   switch(op){case 0x6a:case 0x6b:case 0x6c:case 0x6d:case 0x6e:case 0x71:case 0x72:case 0x73:case 0x74:case 0x75:case 0x76:case 0x7c:case 0x7d:case 0x7e:case 0x83:case 0x84:case 0x85:return true;}
   return false;
@@ -509,6 +509,49 @@ int execute_trap_assertion(GLWASM_Runtime * runtime, GLWASM_Module * module,
   const std::string expected_text = text_bytes(expected);
   return trap_message_matches(glwasm_runtime_last_trap(runtime),expected_text)
       ? 1 : -1;
+}
+
+int execute_exception_assertion(GLWASM_Runtime * runtime, GLWASM_Module * module,
+    const GLWASM_Command & command) {
+  const GLWASM_Text * invoke = semantic_child(command.syntax, 1);
+  if (!runtime || !module || !invoke ||
+      glwasm_text_kind(invoke) != GLWASM_TEXT_LIST ||
+      glwasm_text_size(invoke) < 2 ||
+      text_bytes(glwasm_text_at(invoke, 0)) != "invoke")
+    return 0;
+  const std::string name = text_bytes(glwasm_text_at(invoke, 1));
+  uint32_t function = UINT32_MAX;
+  for (uint32_t i = 0; i < module->nexports; ++i) {
+    const GLWASM_Export * exported = &module->exports[i];
+    if (exported->kind == GLWASM_EXT_FUNC &&
+        std::string(exported->name.bytes, exported->name.length) == name) {
+      function = exported->index;
+      break;
+    }
+  }
+  if (function == UINT32_MAX || !function_supported(module, function))
+    return 0;
+  const GLWASM_TypeDef * type = &module->types[module->funcs[function].type_index];
+  std::vector<uint64_t> args(type->nparams);
+  uint32_t nargs = 0;
+  for (size_t i = 2; i < glwasm_text_size(invoke); ++i) {
+    const GLWASM_Text * arg = glwasm_text_at(invoke, i);
+    if (glwasm_text_kind(arg) != GLWASM_TEXT_LIST ||
+        glwasm_text_size(arg) < 2 || nargs >= type->nparams)
+      return 0;
+    const std::string kind = text_bytes(glwasm_text_at(arg, 0));
+    if (value_kind_for_form(kind) != type->params[nargs].kind ||
+        !parse_wast_typed_value(glwasm_text_at(arg, 1), kind, &args[nargs]))
+      return 0;
+    ++nargs;
+  }
+  if (nargs != type->nparams) return 0;
+  uint64_t ignored = 0;
+  const GLWASM_Result result =
+      glwasm_runtime_invoke(runtime, function, args.data(), nargs, &ignored);
+  if (result != GLWASM_ERR_GUEST)
+    return result == GLWASM_OK ? -1 : 2;
+  return glwasm_runtime_last_trap(runtime) == GLWASM_TRAP_NONE ? 1 : -1;
 }
 
 int execute_invoke(GLWASM_Runtime *runtime,GLWASM_Module *module,const GLWASM_Text*invoke){
@@ -1115,6 +1158,217 @@ static GLWASM_Runtime * parse_and_link(const std::string &source,
       link_error,&runtime);
   if(*result!=GLWASM_OK){glwasm_module_destroy(*out_module);*out_module=nullptr;}
   return runtime;
+}
+
+TEST(WasmExceptions, FuelAndDepthLimitsBypassCatchAll) {
+  const std::string source=
+      "(module"
+      " (func $recurse (block $h (try_table (catch_all $h) (call $recurse))))"
+      " (func (export \"fuel\") (result i32)"
+      "   (block $h (try_table (catch_all $h)"
+      "     (loop $again (br $again)))) (i32.const 1))"
+      " (func (export \"depth\") (result i32)"
+      "   (block $h (try_table (catch_all $h) (call $recurse)))"
+      "   (i32.const 2)))";
+  GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result status;
+  GLWASM_Runtime *fuel_runtime=parse_and_link(source,nullptr,0,&module,&link,&status);
+  ASSERT_EQ(status,GLWASM_OK)<<link.reason;
+  uint64_t result=0;
+  ASSERT_EQ(glwasm_runtime_set_test_limits(fuel_runtime,12,64,0),GLWASM_OK);
+  EXPECT_EQ(glwasm_runtime_invoke_export(fuel_runtime,"fuel",nullptr,0,&result),
+      GLWASM_ERR_LIMIT);
+  glwasm_runtime_destroy(fuel_runtime);
+
+  GLWASM_Runtime *depth_runtime=nullptr;
+  ASSERT_EQ(glwasm_runtime_create(module,&depth_runtime),GLWASM_OK);
+  ASSERT_EQ(glwasm_runtime_set_test_limits(depth_runtime,UINT64_MAX,4,0),
+      GLWASM_OK);
+  EXPECT_EQ(glwasm_runtime_invoke_export(depth_runtime,"depth",nullptr,0,
+      &result),GLWASM_ERR_LIMIT);
+  glwasm_runtime_destroy(depth_runtime);glwasm_module_destroy(module);
+}
+
+TEST(WasmExceptions, ExceptionAllocationLimitBypassesCatchAll) {
+  const std::string source=
+      "(module (tag $t)"
+      " (func (export \"run\") (local $count i32)"
+      "   (loop $again"
+      "     (block $caught"
+      "       (try_table (catch_all $caught) (throw $t)))"
+      "     (local.get $count) (i32.const 1) (i32.add)"
+      "     (local.set $count) (br $again))))";
+  GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result status;
+  GLWASM_Runtime *runtime=parse_and_link(source,nullptr,0,&module,&link,&status);
+  ASSERT_EQ(status,GLWASM_OK)<<link.reason;
+  uint64_t result=0;
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"run",nullptr,0,&result),
+      GLWASM_ERR_LIMIT);
+  glwasm_runtime_destroy(runtime);glwasm_module_destroy(module);
+}
+
+TEST(WasmExceptions, PropagatesAcrossFramesAndHonorsClausePriority) {
+  const std::string source=
+      "(module (tag $a) (tag $b)"
+      " (func $raise (throw $b))"
+      " (func (export \"run\") (result i32)"
+      "   (block $outer"
+      "     (block $inner"
+      "       (try_table (catch $a $outer) (catch $b $outer)"
+      "         (catch $b $inner) (call $raise)))"
+      "     (i32.const 3) (return))"
+      "   (i32.const 7)))";
+  GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result status;
+  GLWASM_Runtime *runtime=parse_and_link(source,nullptr,0,&module,&link,&status);
+  ASSERT_EQ(status,GLWASM_OK)<<link.reason;
+  uint64_t result=0;
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"run",nullptr,0,&result),GLWASM_OK);
+  EXPECT_EQ(result,7u);  // The first matching clause branches to $outer.
+  glwasm_runtime_destroy(runtime);glwasm_module_destroy(module);
+}
+
+TEST(WasmExceptions, ImportedTagsMatchByHostIdentity) {
+  const GLWASM_HostValueType parameters[]={GLWASM_HOST_I32};
+  GLWASM_HostTag host_tag{UINT64_C(0xabc123), parameters, 1};
+  const GLWASM_HostImport imports[]={
+      {.module="host.v1",.field="first",.function=nullptr,.resume=nullptr,
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&host_tag}},
+      {.module="host.v1",.field="second",.function=nullptr,.resume=nullptr,
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&host_tag}}};
+  const std::string source=
+      "(module"
+      " (import \"host.v1\" \"first\" (tag $first (param i32)))"
+      " (import \"host.v1\" \"second\" (tag $second (param i32)))"
+      " (func $raise (i32.const 42) (throw $first))"
+      " (func (export \"run\") (result i32)"
+      "   (block $handled (result i32)"
+      "     (try_table (result i32) (catch $second $handled)"
+      "       (call $raise) (i32.const 3)))))";
+  GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result status;
+  GLWASM_Runtime *runtime=parse_and_link(source,imports,2,&module,&link,&status);
+  ASSERT_EQ(status,GLWASM_OK)<<link.reason;
+  uint64_t result=0;
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"run",nullptr,0,&result),
+      GLWASM_OK);
+  EXPECT_EQ(result,42u);
+  glwasm_runtime_destroy(runtime);glwasm_module_destroy(module);
+}
+
+TEST(WasmExceptions, ImportedTagIdentityRequiresMatchingPayloadSignature) {
+  const GLWASM_HostValueType first_parameter[]={GLWASM_HOST_I32};
+  const GLWASM_HostValueType second_parameter[]={GLWASM_HOST_I64};
+  GLWASM_HostTag first_tag{UINT64_C(0xabc123), first_parameter, 1};
+  GLWASM_HostTag second_tag{UINT64_C(0xabc123), second_parameter, 1};
+  const GLWASM_HostImport imports[]={
+      {.module="host.v1",.field="first",.function=nullptr,.resume=nullptr,
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&first_tag}},
+      {.module="host.v1",.field="second",.function=nullptr,.resume=nullptr,
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&second_tag}}};
+  const std::string source=
+      "(module"
+      " (import \"host.v1\" \"first\" (tag $first (param i32)))"
+      " (import \"host.v1\" \"second\" (tag $second (param i64)))"
+      " (func $raise (i32.const 42) (throw $first))"
+      " (func (export \"run\") (result i64)"
+      "   (block $handled (result i64)"
+      "     (try_table (result i64) (catch $second $handled)"
+      "       (call $raise) (i64.const 3)))))";
+  GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result status;
+  GLWASM_Runtime *runtime=parse_and_link(source,imports,2,&module,&link,&status);
+  ASSERT_EQ(status,GLWASM_OK)<<link.reason;
+  uint64_t result=0;
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"run",nullptr,0,&result),
+      GLWASM_ERR_GUEST);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime),GLWASM_TRAP_NONE);
+  glwasm_runtime_destroy(runtime);glwasm_module_destroy(module);
+}
+
+TEST(WasmExceptions, TransfersTypedPayloadInDeclaredOrder) {
+  const std::string source=
+      "(module (type $pair (func (param i32 i64))) (tag $t (type $pair))"
+      " (global $small (mut i32) (i32.const 0))"
+      " (global $wide (mut i64) (i64.const 0))"
+      " (func (export \"run\") (result i32)"
+      "   (block $h (result i32 i64)"
+      "     (try_table (result i32 i64) (catch $t $h)"
+      "       (throw $t (i32.const 7) (i64.const 9))"
+      "       (i32.const 2) (i64.const 3)))"
+      "   (global.set $wide) (global.set $small) (global.get $small))"
+      " (func (export \"wide\") (result i64) (global.get $wide)))";
+  GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result status;
+  GLWASM_Runtime *runtime=parse_and_link(source,nullptr,0,&module,&link,&status);
+  ASSERT_EQ(status,GLWASM_OK)<<link.reason;
+  uint64_t result=0;
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"run",nullptr,0,&result),GLWASM_OK);
+  EXPECT_EQ(result,7u);
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"wide",nullptr,0,&result),GLWASM_OK);
+  EXPECT_EQ(result,9u);
+  glwasm_runtime_destroy(runtime);glwasm_module_destroy(module);
+}
+
+TEST(WasmExceptions, CatchRefPreservesIdentityForThrowRef) {
+  const std::string source=
+      "(module (tag $t (param i32))"
+      " (func (export \"run\") (result i32) (local $ex exnref)"
+      "   (block $h (result i32 exnref)"
+      "     (try_table (result i32) (catch_ref $t $h)"
+      "       (throw $t (i32.const 19)) (i32.const 2))"
+      "     (return))"
+      "   (drop) (return))"
+      " (func (export \"rethrow\") (result i32) (local $ex exnref)"
+      "   (block $h (result i32 exnref)"
+      "     (try_table (result i32) (catch_ref $t $h)"
+      "       (throw $t (i32.const 23)) (i32.const 2))"
+      "     (return))"
+      "   (local.set $ex) (local.get $ex) (throw_ref)))";
+  GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result status;
+  GLWASM_Runtime *runtime=parse_and_link(source,nullptr,0,&module,&link,&status);
+  ASSERT_EQ(status,GLWASM_OK)<<link.reason;
+  uint64_t result=0;
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"run",nullptr,0,&result),GLWASM_OK);
+  EXPECT_EQ(result,19u);
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"rethrow",nullptr,0,&result),
+      GLWASM_ERR_GUEST);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime),GLWASM_TRAP_NONE);
+  glwasm_runtime_destroy(runtime);glwasm_module_destroy(module);
+}
+
+TEST(WasmExceptions, UncaughtAndNullReferenceOutcomesStayDistinct) {
+  const std::string source=
+      "(module (type $empty (func)) (tag $t (type $empty))"
+      " (func $raise (throw $t))"
+      " (func (export \"uncaught\") (call $raise))"
+      " (func (export \"null_ref\") (ref.null exn) (throw_ref)))";
+  GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result status;
+  GLWASM_Runtime *runtime=parse_and_link(source,nullptr,0,&module,&link,&status);
+  ASSERT_EQ(status,GLWASM_OK)<<link.reason;
+  uint64_t result=0;
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"uncaught",nullptr,0,&result),
+      GLWASM_ERR_GUEST);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime),GLWASM_TRAP_NONE);
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"null_ref",nullptr,0,&result),
+      GLWASM_ERR_GUEST);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime),GLWASM_TRAP_INVALID_REFERENCE);
+  glwasm_runtime_destroy(runtime);glwasm_module_destroy(module);
+}
+
+TEST(WasmExceptions, CatchAllRefCanBeRethrownAsTheSameLiveValue) {
+  const std::string source=
+      "(module (tag $t)"
+      " (func (export \"run\") (result i32) (local $ex exnref)"
+      "   (block $h (result exnref)"
+      "     (try_table (result exnref) (catch_all_ref $h)"
+      "       (throw $t) (ref.null exn)))"
+      "   (local.set $ex)"
+      "   (block $outer"
+      "     (try_table (catch_all $outer) (local.get $ex) (throw_ref)))"
+      "   (i32.const 31)))";
+  GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result status;
+  GLWASM_Runtime *runtime=parse_and_link(source,nullptr,0,&module,&link,&status);
+  ASSERT_EQ(status,GLWASM_OK)<<link.reason;
+  uint64_t result=0;
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"run",nullptr,0,&result),GLWASM_OK);
+  EXPECT_EQ(result,31u);
+  glwasm_runtime_destroy(runtime);glwasm_module_destroy(module);
 }
 
 TEST(WastAdapter, MemoryBulkFillPausesAfterAChunkAndResumesRemainingBytesOnce) {
@@ -1782,6 +2036,13 @@ TEST(WastCorpus, EveryPinnedFileParsesAndEveryCommandIsRecognized) {
             if(execution==1){++executed_assertions;++executed_assertions_passed;}
             else if(execution<0){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": executed assert_trap mismatch");}
             else if(execution==2){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": assert_trap invocation failed without a Wasm trap");}
+            else ++pending;
+          }
+          else if(command.kind==GLWASM_COMMAND_ASSERT_EXCEPTION){
+            const int execution=execute_exception_assertion(active_runtime,active_module,command);
+            if(execution==1){++executed_assertions;++executed_assertions_passed;}
+            else if(execution<0){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": executed assert_exception mismatch");}
+            else if(execution==2){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": assert_exception invocation failed without a guest exception");}
             else ++pending;
           }
           else ++pending;

@@ -195,7 +195,12 @@ binary sections, then reuses the decoder and validator. The lowering rejects
 unsupported module fields and instructions explicitly. It does not yet cover
 the in-scope WAT grammar; generated-binary validation errors currently point
 to the module form, while syntax/lowering errors point to their source form.
-Supported return and trap assertions execute through the Story 3 interpreter adapter; unsupported value forms remain pending explicitly.
+Supported return, trap, and guest-exception assertions execute through the
+runtime interpreter adapter; unsupported value forms remain pending explicitly.
+Story 5 adds interpreter dispatch for `throw`, `throw_ref`, and `try_table`,
+including tag identity, payload/ref transfer, nested propagation, and limit
+bypass. The pinned execution baseline records these assertions; compiled-tier
+exception execution remains gated by Story 10.
 
 ## Pinned WAST corpus gate
 

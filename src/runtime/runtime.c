@@ -4,6 +4,7 @@
  */
 #include <ghoti.io/lang-wasm/macros.h>
 #include <ghoti.io/runtime-core/a/boundary.h>
+#include <ghoti.io/runtime-core/b/roots.h>
 #include <ghoti.io/cutil/allocator.h>
 #include "runtime.h"
 #include <math.h>
@@ -50,6 +51,17 @@ typedef struct HostBinding {
   } resource;
 } HostBinding;
 
+typedef struct ExceptionValue {
+  struct ExceptionValue *next;
+  const GCU_Allocator *allocator;
+  uint32_t tag;
+  uint8_t imported_tag;
+  uint8_t reserved[3];
+  uint64_t host_tag_identity;
+  uint32_t payload_count;
+  uint64_t payload[];
+} ExceptionValue;
+
 typedef struct Run {
   GLWASM_Module *m; GRCORE_Context *ctx; GRCORE_EngineId engine;
   GLWASM_Runtime *instance;
@@ -62,6 +74,7 @@ typedef struct Run {
   uint32_t entry; uint64_t *args; uint32_t nargs; uint64_t result;
   size_t stack_base;
   uint32_t pending_host_function; int pending_host;
+  ExceptionValue *pending_exception;
   void *snapshot_restore;
   uint32_t bulk_func, bulk_pc, bulk_op;
   uint64_t bulk_dst, bulk_src, bulk_len, bulk_done, bulk_value;
@@ -78,6 +91,8 @@ struct GLWASM_Runtime {
   const GCU_Allocator *guest_alloc;
   GRCORE_Group *group; GRCORE_Options *options;
   GRCORE_Context *context; GRCORE_EngineId engine; uintptr_t boundary_token; Run run;
+  GRCORE_Context *root_context;
+  ExceptionValue *exceptions;
   GRCORE_Context *boundary_context;
   GRCORE_EngineId boundary_engine;
   Run nested_saved_run;
@@ -89,6 +104,7 @@ struct GLWASM_Runtime {
   GRCORE_BoundaryRef nested_boundary;
   int nested_active;
   int nested_owns_run;
+  int nested_root_added;
 };
 
 static atomic_uintptr_t next_boundary_token=1;
@@ -109,6 +125,59 @@ struct GLWASM_Snapshot {
   uint64_t bulk_dst,bulk_src,bulk_len,bulk_done,bulk_value;
   int bulk_active;
 };
+
+static void enumerate_exception_roots(GRCORE_Context *context, void *value,
+    const GRCORE_RootVisitor *visitor) {
+  GLWASM_Runtime *runtime=(GLWASM_Runtime *)value;
+  (void)context;
+  if(!runtime||!visitor||!visitor->slot)return;
+  for(ExceptionValue *exception=runtime->exceptions;exception;
+      exception=exception->next) {
+    if(exception->tag>=runtime->module->ntags)continue;
+    uint32_t type_index=runtime->module->tags[exception->tag].type_index;
+    if(type_index>=runtime->module->ntypes)continue;
+    GLWASM_TypeDef *type=&runtime->module->types[type_index];
+    uint32_t count=exception->payload_count<type->nparams
+        ?exception->payload_count:type->nparams;
+    for(uint32_t i=0;i<count;i++) {
+      GLWASM_ValType t=type->params[i];
+      if(t.kind==GLWASM_VK_REF&&t.heap!=GLWASM_HT_FUNC&&
+          t.heap!=GLWASM_HT_NOFUNC)
+        visitor->slot(visitor->user,&exception->payload[i]);
+    }
+  }
+}
+
+static const GRCORE_RootSource exception_root_source=
+    GRCORE_ROOT_SOURCE_INIT("lang-wasm exceptions",enumerate_exception_roots);
+
+static GRCORE_Result ensure_exception_root_source(GRCORE_Context *context,
+    GLWASM_Runtime *runtime,int *out_added) {
+  size_t count=grcore_context_root_source_count(context);
+  for(size_t i=0;i<count;i++){
+    const GRCORE_RootSource *source=NULL;void *value=NULL;
+    if(grcore_context_root_source(context,i,&source,&value)==GRCORE_OK&&
+        source==&exception_root_source&&value==runtime){
+      if(out_added)*out_added=0;
+      return GRCORE_OK;
+    }
+  }
+  GRCORE_Result result=grcore_context_add_root_source(context,
+      &exception_root_source,runtime);
+  if(result==GRCORE_OK&&out_added)*out_added=1;
+  return result;
+}
+
+static void free_exceptions(GLWASM_Runtime *runtime) {
+  ExceptionValue *exception=runtime?runtime->exceptions:NULL;
+  while(exception) {
+    ExceptionValue *next=exception->next;
+    gcu_allocator_free(exception->allocator,exception);
+    exception=next;
+  }
+  if(runtime)runtime->exceptions=NULL;
+  if(runtime)runtime->run.pending_exception=NULL;
+}
 
 static GLWASM_HostValueType host_value_type(GLWASM_ValType type) {
   switch(type.kind) {
@@ -402,21 +471,189 @@ static GLWASM_Result initialize_memories(GLWASM_Module *m, uint64_t *globals,
 static uint64_t * slots(GRCORE_Stack *s, GRCORE_FrameRef f) { return grcore_stack_slots(s,f); }
 
 static void trap_poll(GRCORE_Context *context, void *value, GRCORE_PollCall *call) {
-  (void)context;
   Run *r=(Run *)value;
-  if(r && r->trap!=GLWASM_TRAP_NONE){
+  if(r && (r->trap!=GLWASM_TRAP_NONE||r->error==GLWASM_ERR_GUEST)){
     (void)grcore_pollcall_set_unwind_result(call,GRCORE_ERR_GUEST);
     (void)grcore_pollcall_vote(call,GRCORE_VERDICT_UNWIND);
+    return;
+  }
+  if(r){
+    uint64_t fuel_limit=grcore_context_fuel_limit(context);
+    uint64_t memory_limit=grcore_context_memory_bytes(context);
+    uint64_t memory_used=grcore_context_memory_in_use(context);
+    if((fuel_limit!=UINT64_MAX&&
+        grcore_context_fuel_remaining(context)==0)||
+        (memory_limit!=UINT64_MAX&&memory_used>memory_limit)){
+      r->error=GLWASM_ERR_LIMIT;
+      (void)grcore_pollcall_set_unwind_result(call,GRCORE_ERR_LIMIT);
+      (void)grcore_pollcall_vote(call,GRCORE_VERDICT_UNWIND);
+    }
   }
 }
 static const GRCORE_Key trap_key=GRCORE_KEY_INIT("wasm-trap",
   GRCORE_CARDINALITY_ONE,GRCORE_PHASE_DECIDE,NULL,trap_poll,NULL,NULL,NULL);
+
+static ExceptionValue *find_exception(GLWASM_Runtime *runtime,
+    uint64_t reference) {
+  if(!runtime||!reference)return NULL;
+  for(ExceptionValue *exception=runtime->exceptions;exception;
+      exception=exception->next)
+    if((uint64_t)(uintptr_t)exception==reference)return exception;
+  return NULL;
+}
+
+static int exception_tag_matches(const Run *run,const ExceptionValue *exception,
+    uint32_t tag_index) {
+  if(!run||!exception||tag_index>=run->m->ntags)return 0;
+  const GLWASM_Tag *tag=&run->m->tags[tag_index];
+  if(tag->imported!=exception->imported_tag)return 0;
+  if(!tag->imported)return tag_index==exception->tag;
+  HostBinding *binding=resource_binding(run,GLWASM_HOST_IMPORT_TAG,tag_index);
+  if(!binding||binding->resource.tag.identity==0||
+      binding->resource.tag.identity!=exception->host_tag_identity||
+      exception->tag>=run->m->ntags)return 0;
+  const GLWASM_Tag *thrown_tag=&run->m->tags[exception->tag];
+  if(thrown_tag->type_index>=run->m->ntypes||tag->type_index>=run->m->ntypes)
+    return 0;
+  const GLWASM_TypeDef *thrown_type=&run->m->types[thrown_tag->type_index];
+  const GLWASM_TypeDef *caught_type=&run->m->types[tag->type_index];
+  if(thrown_type->nparams!=caught_type->nparams)return 0;
+  for(uint32_t i=0;i<thrown_type->nparams;i++){
+    const GLWASM_ValType *a=&thrown_type->params[i];
+    const GLWASM_ValType *b=&caught_type->params[i];
+    if(a->kind!=b->kind||a->nullable!=b->nullable||a->heap!=b->heap||
+        a->index!=b->index||a->mut!=b->mut)return 0;
+  }
+  return 1;
+}
+
+static ExceptionValue *new_exception(Run *run,uint32_t tag_index,
+    const uint64_t *payload) {
+  if(!run||!run->instance||tag_index>=run->m->ntags)return NULL;
+  const GLWASM_Tag *tag=&run->m->tags[tag_index];
+  if(tag->type_index>=run->m->ntypes)return NULL;
+  const GLWASM_TypeDef *type=&run->m->types[tag->type_index];
+  uint64_t bytes64=(uint64_t)sizeof(ExceptionValue)+
+      (uint64_t)type->nparams*sizeof(uint64_t);
+  if(bytes64>SIZE_MAX)return NULL;
+  size_t bytes=(size_t)bytes64;
+  ExceptionValue *exception=gcu_allocator_calloc(run->guest_alloc,1,bytes);
+  if(!exception){
+    uint64_t budget=grcore_context_memory_bytes(run->ctx);
+    uint64_t used=grcore_context_memory_in_use(run->ctx);
+    run->error=budget!=UINT64_MAX&&
+        (used>=budget||(uint64_t)bytes>budget-used)
+        ?GLWASM_ERR_LIMIT:GLWASM_ERR_OOM;
+    return NULL;
+  }
+  exception->allocator=run->guest_alloc;
+  exception->tag=tag_index;
+  exception->imported_tag=tag->imported;
+  exception->payload_count=type->nparams;
+  if(tag->imported){
+    HostBinding *binding=resource_binding(run,GLWASM_HOST_IMPORT_TAG,tag_index);
+    if(!binding||!binding->resource.tag.identity){
+      gcu_allocator_free(exception->allocator,exception);
+      return NULL;
+    }
+    exception->host_tag_identity=binding->resource.tag.identity;
+  }
+  if(type->nparams)memcpy(exception->payload,payload,
+      (size_t)type->nparams*sizeof(uint64_t));
+  exception->next=run->instance->exceptions;
+  run->instance->exceptions=exception;
+  return exception;
+}
+
+/* Search live try_table labels from the throwing frame outwards. Handled
+ * exceptions only edit Wasm frames; the runtime-core unwinder remains reserved
+ * for traps and terminal limits. */
+static int dispatch_exception(Run *run,ExceptionValue *exception) {
+  if(!run||!exception||!run->ctx)return 0;
+  GRCORE_Stack *stack=grcore_context_stack(run->ctx);
+  while(grcore_stack_frame_count(stack)>run->stack_base){
+    GRCORE_FrameRef frame=grcore_stack_top(stack);
+    uint64_t *slots_ptr=slots(stack,frame);
+    if(!slots_ptr)return 0;
+    uint32_t function_index=(uint32_t)slots_ptr[H_FUNC];
+    if(function_index>=run->m->nfuncs)return 0;
+    GLWASM_Func *function=&run->m->funcs[function_index];
+    uint32_t control_depth=(uint32_t)slots_ptr[H_CTRL_DEPTH];
+    for(uint32_t cursor=control_depth;cursor>0;--cursor){
+      size_t control=control_base(function)+2u*(cursor-1u);
+      uint32_t opener=(uint32_t)slots_ptr[control];
+      if(opener>=function->nins||function->ins[opener].op!=0x1f)continue;
+      GLWASM_Instr *try_table=&function->ins[opener];
+      if(try_table->b>function->ncatches||
+          try_table->d>function->ncatches-try_table->b)return 0;
+      for(uint32_t i=0;i<try_table->d;i++){
+        GLWASM_Catch *clause=&function->catches[try_table->b+i];
+        if(!clause->resolved)return 0;
+        if(clause->kind<2&&
+            !exception_tag_matches(run,exception,clause->tag))continue;
+
+        uint32_t target_depth=0;
+        size_t destination=H_OPERANDS+function->nparams+function->nlocals;
+        uint32_t target_arity=run->m->types[function->type_index].nresults;
+        if(clause->target_opener!=UINT32_MAX){
+          int found=0;
+          for(uint32_t j=0;j<control_depth;j++){
+            size_t target_control=control_base(function)+2u*j;
+            if((uint32_t)slots_ptr[target_control]==clause->target_opener){
+              destination=(size_t)slots_ptr[target_control+1u];
+              target_arity=branch_arity(function,clause->target_opener);
+              target_depth=function->ins[clause->target_opener].op==0x03
+                  ?j+1u:j;
+              found=1;
+              break;
+            }
+          }
+          if(!found)return 0;
+        }
+        uint32_t caught_count=clause->kind==0||clause->kind==1
+            ?exception->payload_count:0;
+        uint32_t output_count=caught_count+(clause->kind==1||clause->kind==3);
+        if(output_count!=target_arity)return 0;
+        uint32_t old_sp=(uint32_t)slots_ptr[H_SP];
+        if(destination>old_sp)return 0;
+        memset(&slots_ptr[destination],0,
+            (size_t)(old_sp-destination)*sizeof(*slots_ptr));
+        if(caught_count)memcpy(&slots_ptr[destination],exception->payload,
+            (size_t)caught_count*sizeof(*slots_ptr));
+        if(clause->kind==1||clause->kind==3)
+          slots_ptr[destination+caught_count]=(uint64_t)(uintptr_t)exception;
+        slots_ptr[H_CTRL_DEPTH]=target_depth;
+        slots_ptr[H_PC]=clause->target_pc;
+        slots_ptr[H_SP]=(uint32_t)(destination+output_count);
+        run->pending_exception=NULL;
+        return 1;
+      }
+    }
+    (void)grcore_stack_pop(stack);
+  }
+  run->pending_exception=NULL;
+  run->error=GLWASM_ERR_GUEST;
+  return 0;
+}
+
 static GRCORE_Step raise_trap(GRCORE_Context *ctx,Run *r,uint32_t fi,
     uint32_t pc,GLWASM_RuntimeTrap trap){
   r->trap=trap;
   const GLWASM_Func *fn=&r->m->funcs[fi];
   GRCORE_Verdict v=grcore_stack_poll(ctx,fi,fn->translated->offsets[pc]);
   return v==GRCORE_VERDICT_UNWIND?GRCORE_STEP_UNWOUND:GRCORE_STEP_FINISHED;
+}
+
+static GRCORE_Step finish_uncaught_exception(GRCORE_Context *ctx,Run *run,
+    uint32_t function,uint32_t pc) {
+  uint64_t offset=0;
+  if(function<run->m->nfuncs&&run->m->funcs[function].translated&&
+      pc<run->m->funcs[function].translated->offset_count)
+    offset=run->m->funcs[function].translated->offsets[pc];
+  GRCORE_Verdict verdict=grcore_poll(ctx,(GRCORE_Location){"wasm",
+      offset<=INT_MAX?(int)offset:INT_MAX});
+  return verdict==GRCORE_VERDICT_UNWIND?GRCORE_STEP_UNWOUND:
+      GRCORE_STEP_FINISHED;
 }
 
 static GRCORE_Step execute(GRCORE_Context *ctx, void *opaque) {
@@ -470,7 +707,7 @@ static GRCORE_Step execute(GRCORE_Context *ctx, void *opaque) {
     switch(in.op){
       case 0x00:return raise_trap(ctx,r,fi,pc,GLWASM_TRAP_UNREACHABLE);
       case 0x01: break;
-      case 0x02: case 0x03: case 0x04:{
+      case 0x02: case 0x03: case 0x04: case 0x1f:{
         uint64_t condition=1;
         if(in.op==0x04)condition=p[--sp];
         uint32_t nparams=in.a<fn->nblocks?fn->blocks[in.a].nparams:0;uint32_t depth=(uint32_t)p[H_CTRL_DEPTH];
@@ -482,6 +719,42 @@ static GRCORE_Step execute(GRCORE_Context *ctx, void *opaque) {
       }
       case 0x05:{uint32_t depth=(uint32_t)p[H_CTRL_DEPTH];if(depth){size_t cb=control_base(fn)+2u*(depth-1u);uint32_t op=(uint32_t)p[cb];uint32_t nres=block_results(fn,fn->ins[op].a);sp=(uint32_t)p[cb+1]+nres;p[H_CTRL_DEPTH]=depth-1;}p[H_PC]=ti->alternate_target;break;}
       case 0x0b:{uint32_t depth=(uint32_t)p[H_CTRL_DEPTH];if(depth){size_t cb=control_base(fn)+2u*(depth-1u);uint32_t op=(uint32_t)p[cb];uint32_t nres=block_results(fn,fn->ins[op].a);sp=(uint32_t)p[cb+1]+nres;p[H_CTRL_DEPTH]=depth-1;}break;}
+      case 0x08: {
+        if(in.a>=r->m->ntags||r->m->tags[in.a].type_index>=r->m->ntypes){
+          r->error=GLWASM_ERR_INTERNAL;return GRCORE_STEP_FINISHED;
+        }
+        GLWASM_TypeDef *type=&r->m->types[r->m->tags[in.a].type_index];
+        if(sp<H_OPERANDS+fn->nparams+fn->nlocals+type->nparams){
+          r->error=GLWASM_ERR_INTERNAL;return GRCORE_STEP_FINISHED;
+        }
+        uint32_t payload_base=sp-type->nparams;
+        ExceptionValue *exception=new_exception(r,in.a,&p[payload_base]);
+        if(!exception){if(r->error==GLWASM_OK)r->error=GLWASM_ERR_OOM;return GRCORE_STEP_FINISHED;}
+        sp=payload_base;p[H_SP]=sp;
+        r->pending_exception=exception;
+        if(dispatch_exception(r,exception)){
+          f=grcore_stack_top(s);p=slots(s,f);sp=(uint32_t)p[H_SP];
+          break;
+        }
+        return finish_uncaught_exception(ctx,r,fi,pc);
+      }
+      case 0x0a: {
+        if(sp<=H_OPERANDS+fn->nparams+fn->nlocals){
+          r->error=GLWASM_ERR_INTERNAL;return GRCORE_STEP_FINISHED;
+        }
+        uint64_t reference=p[--sp];p[H_SP]=sp;
+        if(!reference)return raise_trap(ctx,r,fi,pc,
+            GLWASM_TRAP_INVALID_REFERENCE);
+        ExceptionValue *exception=find_exception(r->instance,reference);
+        if(!exception)return raise_trap(ctx,r,fi,pc,
+            GLWASM_TRAP_INVALID_REFERENCE);
+        r->pending_exception=exception;
+        if(dispatch_exception(r,exception)){
+          f=grcore_stack_top(s);p=slots(s,f);sp=(uint32_t)p[H_SP];
+          break;
+        }
+        return finish_uncaught_exception(ctx,r,fi,pc);
+      }
       case 0x0f: p[H_PC]=fn->nins; break;
       case 0x10: case 0x12: case 0x11: case 0x13: {
         uint32_t callee=in.a;uint64_t indirect_index=0;
@@ -1179,7 +1452,10 @@ static GLWASM_Result runtime_create_impl(GLWASM_Module*m,
     .data_dropped=r->data_dropped,.elements_dropped=r->elements_dropped,
     .guest_alloc=r->guest_alloc};
   core_result=grcore_context_register(r->context,&trap_key,&r->run);
+  if(core_result==GRCORE_OK)
+    core_result=ensure_exception_root_source(r->context,r,NULL);
   if(core_result!=GRCORE_OK){GLWASM_Result result=map_core_result(core_result);glwasm_runtime_destroy(r);return result;}
+  r->root_context=r->context;
   if(m->has_start){uint64_t ignored=0;GLWASM_Result started=glwasm_runtime_invoke(r,m->start,NULL,0,&ignored);if(started!=GLWASM_OK){glwasm_runtime_destroy(r);return started;}}
   *out=r;return GLWASM_OK;
 }
@@ -1234,6 +1510,11 @@ static GLWASM_Result finish_nested(GLWASM_Runtime *runtime,GRCORE_Result core,
     runtime->run.paused=1;
     return GLWASM_ERR_PAUSED;
   }
+  if(runtime->nested_root_added){
+    (void)grcore_context_remove_root_source(runtime->nested_context,
+        &exception_root_source,runtime);
+    runtime->nested_root_added=0;
+  }
   GRCORE_Stack *stack=grcore_context_stack(runtime->nested_context);
   while(grcore_stack_frame_count(stack)>runtime->nested_base)
     (void)grcore_stack_pop(stack);
@@ -1287,17 +1568,25 @@ GLWASM_Result glwasm_runtime_invoke_nested(GLWASM_Runtime *runtime,
     if(core!=GRCORE_OK)return map_core_result(core);
     runtime->boundary_context=context;runtime->boundary_engine=wasm_engine;
   }
+  int root_added=0;
+  core=ensure_exception_root_source(context,runtime,&root_added);
+  if(core!=GRCORE_OK)return map_core_result(core);
   GRCORE_Stack *stack=grcore_context_stack(context);
   size_t base=grcore_stack_frame_count(stack);
   GRCORE_BoundaryRef boundary={0};
   core=grcore_boundary_enter(stack,caller,wasm_engine,instance_token,true,
       &boundary);
-  if(core!=GRCORE_OK)return map_core_result(core);
+  if(core!=GRCORE_OK){
+    if(root_added)(void)grcore_context_remove_root_source(context,
+        &exception_root_source,runtime);
+    return map_core_result(core);
+  }
   runtime->nested_saved_run=runtime->run;
   runtime->nested_saved_token=runtime->boundary_token;
   runtime->nested_context=context;runtime->nested_caller=caller;
   runtime->nested_instance=instance_token;runtime->nested_base=base;
   runtime->nested_boundary=boundary;
+  runtime->nested_root_added=root_added;
   Run *run=&runtime->run;
   run->ctx=context;run->engine=wasm_engine;run->instance=runtime;
   run->entry=function;run->nargs=argument_count;run->stack_base=base;
@@ -1371,6 +1660,7 @@ GLWASM_Result glwasm_runtime_resume_nested(GLWASM_Runtime *runtime,
 }
 void glwasm_runtime_destroy(GLWASM_Runtime *r) {
   if (!r) return;
+  free_exceptions(r);
   if (r->memories && r->guest_alloc)
     for (uint32_t i = 0; i < r->module->nmems; i++)
       gcu_allocator_free(r->guest_alloc, r->memories[i]);
@@ -1397,7 +1687,7 @@ void glwasm_runtime_destroy(GLWASM_Runtime *r) {
 }
 GLWASM_Result glwasm_runtime_set_test_limits(GLWASM_Runtime *r,
     uint64_t fuel, uint64_t depth, int always_move) {
-  if (!r || r->run.active) return GLWASM_ERR_INVALID;
+  if (!r || r->run.active || r->exceptions) return GLWASM_ERR_INVALID;
   GRCORE_Options *options = NULL;
   GRCORE_Context *context = NULL;
   GRCORE_EngineId engine = 0;
@@ -1412,6 +1702,7 @@ GLWASM_Result glwasm_runtime_set_test_limits(GLWASM_Runtime *r,
   if (cr == GRCORE_OK) cr = grcore_context_create(r->group, options, &context);
   if (cr == GRCORE_OK) cr = grcore_engine_register(context, &descriptor, &engine);
   if (cr == GRCORE_OK) cr = grcore_context_register(context, &trap_key, &r->run);
+  if (cr == GRCORE_OK) cr = ensure_exception_root_source(context,r,NULL);
   if (cr == GRCORE_OK)
     cr = grcore_stack_set_always_move(grcore_context_stack(context), always_move != 0);
   if (cr != GRCORE_OK) {
@@ -1504,6 +1795,7 @@ GLWASM_Result glwasm_runtime_set_test_limits(GLWASM_Runtime *r,
   if (r->context) grcore_context_destroy(r->context);
   if (r->options) grcore_options_destroy(r->options);
   r->context = context;
+  r->root_context = context;
   r->options = options;
   r->engine = engine;
   r->guest_alloc = new_alloc;

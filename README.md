@@ -40,8 +40,13 @@ Validated instructions retain absolute module byte offsets (for WAT, offsets
 refer to the canonical lowered binary). Translation creates module-owned
 instruction arrays with resolved structured branch destinations and a total,
 monotonic offset map including its terminal boundary. Executable coverage is
-provided by an internal runtime-core-backed interpreter used by the Story 3
-test adapter. Its current executable subset covers i32 `eqz`, `eq`, `ne`, signed and
+provided by an internal runtime-core-backed interpreter used by the test
+adapter. Its current executable subset covers exception tags, `throw`,
+`throw_ref`, and `try_table`, including ordered handler dispatch, payload and
+exception-reference transfer, nested-call propagation, and terminal limit
+handling. Focused tests and 21 pinned exception assertions cover this subset;
+compiled execution remains assigned to Story 10. The remaining subset covers
+i32 `eqz`, `eq`, `ne`, signed and
 unsigned `lt`, `gt`, `le`, and `ge`; i32 `add`, `sub`, `mul`, signed/unsigned
 `div`, `and`, `or`, `xor`, and shifts; i64 `add`, `sub`, `mul`, `and`, `or`,
 and `xor`; and f32/f64 `add`, `sub`, `mul`, `div`, `min`, `max`, and

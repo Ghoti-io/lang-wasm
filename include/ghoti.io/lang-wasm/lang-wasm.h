@@ -32,6 +32,8 @@
 #include <ghoti.io/lang-wasm/core.h>
 #include <ghoti.io/lang-wasm/decode.h>
 #include <ghoti.io/lang-wasm/limits.h>
+#include <ghoti.io/lang-wasm/policy.h>
+#include <ghoti.io/lang-wasm/host.h>
 #include <ghoti.io/lang-wasm/parse.h>
 #include <ghoti.io/lang-wasm/script.h>
 #include <ghoti.io/lang-wasm/macros.h>

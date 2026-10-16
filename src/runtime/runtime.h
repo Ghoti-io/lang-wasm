@@ -3,6 +3,7 @@
 #define GHOTI_IO_GLWASM_RUNTIME_H
 
 #include <ghoti.io/lang-wasm/macros.h>
+#include <ghoti.io/lang-wasm/host.h>
 #include "../module_internal.h"
 #include <ghoti.io/runtime-core/runtime-core.h>
 
@@ -10,7 +11,9 @@ typedef struct GLWASM_Runtime GLWASM_Runtime;
 typedef enum { GLWASM_TRAP_NONE=0, GLWASM_TRAP_UNREACHABLE,
   GLWASM_TRAP_DIVIDE_BY_ZERO, GLWASM_TRAP_INTEGER_OVERFLOW,
   GLWASM_TRAP_TABLE_OUT_OF_BOUNDS, GLWASM_TRAP_UNINITIALIZED_ELEMENT,
-  GLWASM_TRAP_INDIRECT_CALL_TYPE_MISMATCH } GLWASM_RuntimeTrap;
+  GLWASM_TRAP_INDIRECT_CALL_TYPE_MISMATCH,
+  GLWASM_TRAP_MEMORY_OUT_OF_BOUNDS,
+  GLWASM_TRAP_INVALID_REFERENCE } GLWASM_RuntimeTrap;
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,6 +25,12 @@ void glwasm_runtime_destroy(GLWASM_Runtime *runtime);
  * signature determines each word's type. */
 GLWASM_Result glwasm_runtime_invoke(GLWASM_Runtime *runtime, uint32_t function,
     const uint64_t *args, uint32_t nargs, uint64_t *result);
+/* Test-only mixed-engine entry. Executes one Wasm export synchronously on an
+ * already-running runtime-core context, preserving the caller's frames. */
+GLWASM_Result glwasm_runtime_invoke_nested(GLWASM_Runtime *runtime,
+    GRCORE_Context *context, GRCORE_EngineId caller, uintptr_t instance_token,
+    const char *export_name, const uint64_t *args, uint32_t nargs,
+    uint64_t *result);
 /* A pause returns GLWASM_ERR_PAUSED while keeping the run active; resume it or
  * destroy the runtime before starting another invocation. Fuel and depth
  * exhaustion return GLWASM_ERR_LIMIT and do not leave a resumable run. */

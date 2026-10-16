@@ -195,12 +195,26 @@ SOURCES := $(shell find src -type f -name '*.c')
 LIBOBJECTS := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cflags gtest`
+RJIT_PC ?= ghoti.io-runtime-jit$(BRANCH)
+RJIT_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(RJIT_PC) 2>/dev/null)
+RJIT_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(RJIT_PC) 2>/dev/null)
+RJIT_EXISTS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --exists $(RJIT_PC) 2>/dev/null && echo yes)
+NEED_RJIT_FIXTURE := $(filter test test-quiet test-valgrind test-asan testBoundary_wasm $(APP_DIR)/testBoundary_wasm$(EXE_EXTENSION),$(MAKECMDGOALS))
+ifneq ($(RJIT_EXISTS),yes)
+ifneq ($(NEED_RJIT_FIXTURE),)
+ifndef SKIP_DEP_CHECK
+$(error ghoti.io-runtime-jit was not found by pkg-config; the Story 12 compiled boundary fixture requires it)
+endif
+endif
+endif
+TEST_INCLUDE := $(INCLUDE) $(RJIT_CFLAGS)
 
 TEST_GATES ?= check-symbols check-aliasing check-stamps check-fp-contract check-labels check-edges check-wast-corpus fuzz-replay
 
 VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible --track-origins=yes --error-exitcode=1 --suppressions=tests/valgrind.supp
 
 WASMLIBRARY := -Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-archive $(RCORE_LIBS) $(CUTIL_LIBS)
+TEST_WASMLIBRARY := $(WASMLIBRARY) $(RJIT_LIBS)
 
 ifeq ($(OS_NAME), Windows)
 TEST_LDFLAGS := -Wl,--wrap=__mingw_fprintf
@@ -213,6 +227,8 @@ TEST_PAIRS := $(shell find tests -type f -name 'test_*.cpp' 2>/dev/null | sort |
 TEST_SOURCES := $(foreach pair,$(TEST_PAIRS),$(word 1,$(subst |, ,$(pair))))
 TEST_NAMES := $(foreach pair,$(TEST_PAIRS),$(word 2,$(subst |, ,$(pair))))
 TEST_EXECUTABLES := $(addprefix $(APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(TEST_NAMES)))
+SAMPLE_HOST := $(APP_DIR)/sample_host$(EXE_EXTENSION)
+SAMPLE_HOST_OBJECT := $(OBJ_DIR)/examples/sample_host.o
 
 TEST_LD_PATH := $(APP_DIR):$(RCORE_LIBDIR):$(CUTIL_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)
 
@@ -270,16 +286,26 @@ $(APP_DIR)/$(STATIC_TARGET): $(LIBOBJECTS)
 	@rm -f $@
 	ar rcs $@ $^
 
+$(SAMPLE_HOST_OBJECT): examples/sample_host.c $(FLAGS_STAMP) | $(LIBVER_GEN)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(INCLUDE) $(CUTIL_CFLAGS) $(RCORE_CFLAGS) -c $< -o $@
+
+$(SAMPLE_HOST): $(SAMPLE_HOST_OBJECT) $(APP_DIR)/$(STATIC_TARGET) | $(APP_DIR)/$(TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $(SAMPLE_HOST_OBJECT) $(LDFLAGS) $(WASMLIBRARY)
+
+sample: $(SAMPLE_HOST) ## Run the policy-bounded sample plugin host
+	LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(SAMPLE_HOST) examples/runaway.wasm
+
 $(OBJ_DIR)/tests/%.o: tests/unit/%.cpp $(FLAGS_STAMP) | $(LIBVER_GEN)
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 define test-executable-rule
 TEST_OBJ_$1 := $(OBJ_DIR)/tests/$(basename $(notdir $1)).o
 
 $(APP_DIR)/$2$(EXE_EXTENSION): $$(TEST_OBJ_$1) $(APP_DIR)/$(STATIC_TARGET) | $(APP_DIR)/$(TARGET)
 	@mkdir -p $$(@D)
-	$(CXX) $(CXXFLAGS) -o $$@ $$(TEST_OBJ_$1) $(LDFLAGS) $(TEST_LDFLAGS) $(WASMLIBRARY) $(TESTFLAGS)
+	$(CXX) $(CXXFLAGS) -o $$@ $$(TEST_OBJ_$1) $(LDFLAGS) $(TEST_LDFLAGS) $(TEST_WASMLIBRARY) $(TESTFLAGS)
 endef
 
 $(foreach pair,$(TEST_PAIRS),\
@@ -399,14 +425,14 @@ $(ASAN_ARCHIVE): $(ASAN_LIBOBJECTS)
 
 $(ASAN_OBJ_DIR)/tests/%.o: tests/unit/%.cpp $(ASAN_FLAGS_STAMP) | $(LIBVER_GEN)
 	@mkdir -p $(@D)
-	$(CXX) $(ASAN_CXXFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+	$(CXX) $(ASAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
 
 define asan-test-executable-rule
 ASAN_TEST_OBJ_$1 := $(ASAN_OBJ_DIR)/tests/$(basename $(notdir $1)).o
 
 $(ASAN_APP_DIR)/$2$(EXE_EXTENSION): $$(ASAN_TEST_OBJ_$1) $(ASAN_ARCHIVE)
 	@mkdir -p $$(@D)
-	$(CXX) $(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $(ASAN_LDFLAGS) $(ASAN_WASMLIBRARY) $(TESTFLAGS)
+	$(CXX) $(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $(ASAN_LDFLAGS) $(ASAN_WASMLIBRARY) $(RJIT_LIBS) $(TESTFLAGS)
 endef
 
 $(foreach pair,$(TEST_PAIRS),\
@@ -576,12 +602,12 @@ help: ## Display this help
 
 $(FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(CC) $(CXX) $(LIB_CFLAGS) $(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE) $(WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(TESTFLAGS) $(TEST_LDFLAGS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(LIB_CFLAGS) $(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE) $(WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(CUTIL_CFLAGS) $(TEST_INCLUDE) $(RJIT_LIBS) $(TEST_WASMLIBRARY) $(TESTFLAGS) $(TEST_LDFLAGS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(ASAN_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(ASAN_WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(TESTFLAGS)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(TEST_INCLUDE) $(ASAN_WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(RJIT_LIBS) $(TESTFLAGS)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(FUZZ_FLAGS_STAMP): force-flags

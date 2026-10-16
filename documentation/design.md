@@ -1,7 +1,9 @@
 # Design
 
-**Status:** Story 3 translator and interpreter core are implemented; the
-acceptance gates and review are in progress.
+**Status:** Stories 3, 4, and 6 are implemented; Story 12 has the runtime-core
+boundary API and test-only real-Wasm/Tang ABI fixture. Production Tang loader
+integration and cross-heap externref handles remain owned by Tang Stories 14
+and 13.
 
 `lang-wasm` decodes a WebAssembly 3.0 binary, validates it, then translates
 validated functions for execution on runtime-core.
@@ -229,6 +231,10 @@ nondecreasing in-range opcode byte offset.
 
 ## Runtime and fuel
 
+The following paragraph records the original Story 3 interpreter baseline; its
+limited feature inventory is historical and is superseded by the Story 4/6
+surface below.
+
 The internal Story 3 interpreter runs as one runtime-core engine activation
 with guest calls represented by persistent guest-stack frames. The dispatch
 loop is non-recursive in C, reacquires frame slots after operations that may
@@ -256,7 +262,11 @@ than one `ref.func` or `ref.null` are rejected as unsupported during runtime
 creation and counted as deferred by the corpus harness. The internal runtime
 borrows its module, which must outlive the runtime.
 
-The current WAST executor covers i32 `eqz` and comparisons plus selected integer
+The following WAST paragraph records the Story 3 baseline and is superseded by
+the Story 4/6 runtime and public embedding implementation below. It remains as
+history for the original corpus triage.
+
+At the original Story 3 baseline, the WAST executor covered i32 `eqz` and comparisons plus selected integer
 arithmetic/bitwise operators, selected i64 arithmetic/bitwise operators,
 f32/f64 arithmetic, locals/globals, structured branches including `br_table`,
 direct and indirect calls, tail calls, module start functions, and active
@@ -267,6 +277,30 @@ uninitialized elements, and indirect-call type mismatch. Other MVP
 numeric operators and conversions, unsupported multi-result/value forms, and
 later-story instructions remain pending; they are not counted as passes.
 The harness executes supported `assert_return` and `assert_trap` commands. Integer values are type-checked, finite f32/f64 results compare bit-exactly, and canonical, arithmetic, and payload NaN forms use their corresponding WAST matching rules. Executed assertions fail on mismatches or unexpected traps. It is a test-only internal adapter,
-not the future public embedder/import API. Memories, full table operations,
-multi-value execution, exceptions, and general host imports remain later
-work.
+not the public embedder/import API. Its limited memory, table, and import
+coverage described the Story 3 baseline only; Stories 4, 6, and 12 below record
+the current implementation status.
+
+## Stories 4, 6, and 12: instance and host boundaries
+
+Runtime state now belongs to each instance: memory32/64, table32/64, globals,
+active data/element initialization, and dropped-segment state. Linear memory
+and table operations use explicit overflow and bounds checks; bulk operations
+retain progress across polls. Runtime allocations use the context allocator,
+and memory growth follows the context budget and allocator refusal path.
+
+The public host API links exact module/field grants for functions and typed
+resources. Policies are copied presets and can disable features or set context
+budget defaults before decode or execution. Host memory/table providers grant
+temporary leases which end before polls and growth. Callback pauses preserve an
+explicit resume entrypoint, so earlier callback effects are not repeated.
+Snapshots preserve the paused guest execution plus globals, memories, tables,
+and segment-drop state; imported resources, reference-bearing modules, and
+pending host continuations are rejected explicitly until their owners provide
+snapshot hooks.
+
+The mixed-engine boundary API stores engine identity, an opaque instance token,
+and foreign exception origin/identity in runtime-core activation state. It does
+not store or interpret heap addresses. A test-only provider fixture exercises
+token checking, temporary rooting, promotion, and relocation. Production
+cross-heap roots and handles remain the responsibility of Story 13.

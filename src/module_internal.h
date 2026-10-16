@@ -32,6 +32,7 @@
 #include <ghoti.io/lang-wasm/macros.h>
 
 #include <ghoti.io/lang-wasm/decode.h>
+#include <ghoti.io/lang-wasm/policy.h>
 
 #include <stdint.h>
 
@@ -226,6 +227,8 @@ typedef struct GLWASM_Data {
 struct GLWASM_Module {
   GLWASM_Allocator alloc;
   GLWASM_Limits limits;
+  GLWASM_Policy policy;
+  uint8_t has_policy;
   GLWASM_TypeDef * types;
   uint32_t ntypes;
   GLWASM_Import * imports;

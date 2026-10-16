@@ -54,6 +54,8 @@ const char * glwasm_result_string(GLWASM_Result result) {
       return "Guest execution trapped";
     case GLWASM_ERR_PAUSED:
       return "Guest paused";
+    case GLWASM_ERR_LINK:
+      return "Import link failed";
     case GLWASM_RESULT_COUNT:
     default:
       return "Unknown error";

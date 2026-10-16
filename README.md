@@ -120,6 +120,48 @@ int main(void) {
 `NULL` limits are the defaults from `glwasm_limits_default`. `NULL` allocator
 is the default. The module pointer is written only on success.
 
+## Host policy and instances
+
+`glwasm_policy_preset` copies the untrusted, standard, or trusted policy into
+caller-owned storage. Change fields on that copy to override limits, feature
+bits, or runtime budget defaults. `glwasm_module_decode_with_policy` applies
+the limits before decode allocations, rejects disabled in-scope features, and
+stores the selected policy with the module. The policy is immutable after
+decode. Instantiate with `glwasm_runtime_create_with_imports`; every imported
+function must have an exact module-and-field entry in its allowlist. The
+versioned `tang.v1` namespace is not granted implicitly. Destroy instances
+before their borrowed module, and resume a paused call with
+`glwasm_runtime_resume`.
+
+The linker accepts exact module-and-field grants for functions, memories,
+tables, globals, and tags. Resource imports use typed provider callbacks; memory
+and table access holds a short lease that ends before polling or growth. A host
+callback that pauses must provide an explicit resume callback, so resuming does
+not repeat the callback's initial side effects.
+
+Paused snapshots preserve the guest stack and instance state, including globals,
+memories, tables, and segment drop state. Snapshot creation reports
+`GLWASM_ERR_UNSUPPORTED` for imported modules/resources and modules using
+externref or exnref, as well as a pending host callback continuation. Restore
+requires the same still-live module and begins under the destination runtime's
+budget.
+
+Each host call exposes the active runtime-core context, the Wasm engine ID, and
+an opaque per-instance token. A mixed-engine adapter can register its engine
+in that context and open a runtime-core boundary activation for each call. The
+boundary stores foreign exception origin and identity tokens; the owner remains
+responsible for rooting and relocation. The test-only real-Wasm fixture covers
+reentry, pause/resume, instance isolation, and identity transport. Production
+Tang loader integration and cross-heap handle rooting remain owned by Tang
+Story 14 and runtime-core Story 13, respectively.
+
+The runnable sample host invokes `examples/runaway.wasm` under the untrusted
+policy and prints the pause location:
+
+```bash
+make -C libs/lang-wasm sample PREFIX="$PWD/.local-lang-wasm"
+```
+
 ## Building
 
 ```bash

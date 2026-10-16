@@ -77,6 +77,42 @@ const char k_add[] =
     "03 02 01 00 "
     "0a 09 01 07 00 20 00 20 01 6a 0b";
 
+GLWASM_Limits loose();
+
+TEST(Policy, PresetsAndLimitOverridesReachTheDecoder) {
+  GLWASM_Policy policy;
+  ASSERT_EQ(glwasm_policy_preset(GLWASM_POLICY_UNTRUSTED, &policy), GLWASM_OK);
+  EXPECT_EQ(policy.limits.module_bytes, 4u * 1024u * 1024u);
+  EXPECT_FALSE(policy.features & GLWASM_FEATURE_MEMORY64);
+  ASSERT_EQ(glwasm_policy_preset(GLWASM_POLICY_STANDARD, &policy), GLWASM_OK);
+  EXPECT_EQ(policy.limits.module_bytes, 64u * 1024u * 1024u);
+  EXPECT_TRUE(policy.features & GLWASM_FEATURE_MEMORY64);
+
+  policy.features = 0;
+  policy.limits = loose();
+  std::vector<uint8_t> bytes = hex(k_add);
+  GLWASM_Module *module = nullptr;
+  ASSERT_EQ(glwasm_module_decode_with_policy(bytes.data(), bytes.size(),
+      &policy, nullptr, nullptr, &module), GLWASM_OK);
+  glwasm_module_destroy(module);
+  module = nullptr;
+
+  policy.limits.module_bytes = 1;
+  EXPECT_EQ(glwasm_module_decode_with_policy(bytes.data(), bytes.size(),
+      &policy, nullptr, nullptr, &module), GLWASM_ERR_LIMIT);
+  EXPECT_EQ(module, nullptr);
+
+  const std::vector<uint8_t> memory64 = hex(
+      "00 61 73 6d 01 00 00 00 05 04 01 05 01 02");
+  ASSERT_EQ(glwasm_policy_preset(GLWASM_POLICY_UNTRUSTED, &policy), GLWASM_OK);
+  EXPECT_EQ(glwasm_module_decode_with_policy(memory64.data(), memory64.size(),
+      &policy, nullptr, nullptr, &module), GLWASM_ERR_UNSUPPORTED);
+  ASSERT_EQ(glwasm_policy_preset(GLWASM_POLICY_STANDARD, &policy), GLWASM_OK);
+  EXPECT_EQ(glwasm_module_decode_with_policy(memory64.data(), memory64.size(),
+      &policy, nullptr, nullptr, &module), GLWASM_OK);
+  if (module) glwasm_module_destroy(module);
+}
+
 GLWASM_Limits loose() {
   GLWASM_Limits limits;
 

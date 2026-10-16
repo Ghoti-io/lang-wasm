@@ -60,6 +60,7 @@ typedef enum {
   GLWASM_ERR_VALIDATE,     ///< The bytes are Wasm, and they break a rule.
   GLWASM_ERR_GUEST,        ///< Guest execution trapped.
   GLWASM_ERR_PAUSED,       ///< Guest execution paused and can be resumed.
+  GLWASM_ERR_LINK,         ///< An import could not be resolved by the host.
   GLWASM_RESULT_COUNT
 } GLWASM_Result;
 

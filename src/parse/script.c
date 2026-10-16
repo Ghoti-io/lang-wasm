@@ -116,7 +116,7 @@ static int integer_syntax(const GLWASM_Text * node, int allow_sign) {
     ++i;
   unsigned base = 10;
   if (i + 2 < n && bytes[i] == '0' &&
-      (bytes[i + 1] == 'x' || bytes[i + 1] == 'X')) {
+      bytes[i + 1] == 'x') {
     base = 16;
     i += 2;
   }
@@ -142,7 +142,7 @@ static int float_syntax(const GLWASM_Text * node) {
   }
   unsigned base = 10;
   if (i + 2 < n && bytes[i] == '0' &&
-      (bytes[i + 1] == 'x' || bytes[i + 1] == 'X')) {
+      bytes[i + 1] == 'x') {
     base = 16;
     i += 2;
   }
@@ -154,12 +154,14 @@ static int float_syntax(const GLWASM_Text * node) {
   }
   if (!before && !after)
     return 0;
-  if (base == 16 && i < n && (bytes[i] == 'p' || bytes[i] == 'P')) {
-    ++i;
-    if (i < n && (bytes[i] == '+' || bytes[i] == '-'))
+  if (base == 16) {
+    if (i < n && (bytes[i] == 'p' || bytes[i] == 'P')) {
       ++i;
-    if (!number_digits(bytes, n, &i, 10))
-      return 0;
+      if (i < n && (bytes[i] == '+' || bytes[i] == '-'))
+        ++i;
+      if (!number_digits(bytes, n, &i, 10))
+        return 0;
+    }
   }
   else if (base == 10 && i < n && (bytes[i] == 'e' || bytes[i] == 'E')) {
     ++i;

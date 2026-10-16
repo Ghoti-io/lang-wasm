@@ -4,6 +4,8 @@
 #include <ghoti.io/cutil/allocator.h>
 #include <gtest/gtest.h>
 
+#include "module_internal.h"
+
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -843,8 +845,9 @@ TEST(WasmWatLowering, RejectsMalformedInlineTypeUsesBeforeValidation) {
   }
 }
 
-TEST(WasmWatLowering, RejectsFloatSeparatorsAcrossExponentBoundary) {
-  for(const std::string literal : {"1_e1","1e_1","1.0_e1","1.0e_1",".0",".0e0"}) {
+TEST(WasmWatLowering, RejectsMalformedFloatAndHexPrefixes) {
+  for(const std::string literal : {"1_e1","1e_1","1.0_e1","1.0e_1",
+      ".0",".0e0","0X1p0"}) {
     const std::string wat="(module (global f64 (f64.const "+literal+")))";
     GLWASM_Module *module=nullptr;GLWASM_ParseError error{};
     EXPECT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t*>(wat.data()),
@@ -852,6 +855,32 @@ TEST(WasmWatLowering, RejectsFloatSeparatorsAcrossExponentBoundary) {
         << error.message << "\nWAT: " << wat;
     if(module)glwasm_module_destroy(module);
   }
+}
+
+TEST(WasmWatLowering, AcceptsPinnedCorpusHexFloatsWithoutExponent) {
+  const std::string wat =
+      "(module (global f32 (f32.const 0xa0f0099)))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat.data()),
+      wat.size(), nullptr, nullptr, &error, &module), GLWASM_OK)
+      << error.message;
+  ASSERT_NE(module, nullptr);
+  ASSERT_EQ(module->nglobals, 1u);
+  ASSERT_GE(module->globals[0].init.nins, 1u);
+  EXPECT_EQ(module->globals[0].init.ins[0].op, 0x43u);
+  EXPECT_EQ(module->globals[0].init.ins[0].a, UINT32_C(0x4d20f00a));
+  glwasm_module_destroy(module);
+}
+
+TEST(WasmWatLowering, RejectsUppercaseHexIntegerPrefix) {
+  const std::string wat = "(module (global i32 (i32.const 0X1)))";
+  GLWASM_Module *module = nullptr;
+  GLWASM_ParseError error{};
+  EXPECT_EQ(glwasm_wat_module_parse(reinterpret_cast<const uint8_t *>(wat.data()),
+      wat.size(), nullptr, nullptr, &error, &module), GLWASM_ERR_CORRUPT)
+      << error.message;
+  if (module) glwasm_module_destroy(module);
 }
 
 int main(int argc, char ** argv) {

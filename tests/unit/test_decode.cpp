@@ -837,6 +837,22 @@ TEST(Decode, ExplicitNonNullAbstractHeapTypeIsDeferred) {
   EXPECT_EQ(module, nullptr);
 }
 
+TEST(Decode, RejectsNegativeHeapTypeEncodedAsMultiByteS33) {
+  /* 0x6e is the one-byte abstract `any` heap type. The padded two-byte
+   * signed-LEB encoding below also decodes to -18 and is not a heaptype
+   * encoding in the binary grammar. */
+  std::vector<uint8_t> bytes = hex(
+      "00 61 73 6d 01 00 00 00"
+      "01 07 01 60 01 64 ee 7f 00");
+  GLWASM_Module * module = reinterpret_cast<GLWASM_Module *>(1);
+  GLWASM_Failure failure;
+
+  EXPECT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), NULL, NULL,
+      &failure, &module), GLWASM_ERR_CORRUPT);
+  EXPECT_EQ(failure.result, GLWASM_ERR_CORRUPT);
+  EXPECT_EQ(module, reinterpret_cast<GLWASM_Module *>(1));
+}
+
 TEST(Decode, DefaultsMatchTheNumberedCaps) {
   GLWASM_Limits limits;
 

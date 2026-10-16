@@ -548,7 +548,8 @@ static int numeric_text(const uint8_t*p,size_t z,char*out,size_t capacity){
 }
 static int float_separators_valid(const uint8_t*p,size_t z){
   size_t i=0;if(i<z&&(p[i]=='+'||p[i]=='-'))i++;
-  int hex=i+1<z&&p[i]=='0'&&(p[i+1]=='x'||p[i+1]=='X');
+  if(i+1<z&&p[i]=='0'&&p[i+1]=='X')return 0;
+  int hex=i+1<z&&p[i]=='0'&&p[i+1]=='x';
   int payload=0,exponent=0;
   for(;i<z;i++){
     if(p[i]==':'){payload=1;continue;}
@@ -563,9 +564,31 @@ static int float_separators_valid(const uint8_t*p,size_t z){
   }
   return 1;
 }
+static int hex_float_syntax(const char*s){
+  const char*p=s;
+  if(*p=='+'||*p=='-')p++;
+  if(p[0]!='0'||p[1]!='x')return 1;
+  p+=2;int digits=0;
+  while(hex_digit((uint8_t)*p)){digits++;p++;}
+  if(*p=='.'){
+    p++;
+    while(hex_digit((uint8_t)*p)){digits++;p++;}
+  }
+  if(!digits)return 0;
+  /* The pinned wg-3.0 corpus uses bare hexadecimal mantissas. Keep those
+   * forms as exponent zero for corpus compatibility; an explicit exponent
+   * still has to contain at least one decimal digit. */
+  if(!*p)return 1;
+  if(*p!='p'&&*p!='P')return 0;
+  p++;
+  if(*p=='+'||*p=='-')p++;
+  int exponent=0;
+  while(*p>='0'&&*p<='9'){exponent++;p++;}
+  return exponent&&!*p;
+}
 static int parse_i64(const GLWASM_Text*n,int64_t*out){
   size_t z;const uint8_t*p=glwasm_text_bytes(n,&z);char s[64];if(!numeric_text(p,z,s,sizeof(s)))return 0;
-  const char*digits=s+(s[0]=='-'||s[0]=='+'?1:0);int base=digits[0]=='0'&&(digits[1]=='x'||digits[1]=='X')?16:10;
+  const char*digits=s+(s[0]=='-'||s[0]=='+'?1:0);int base=digits[0]=='0'&&digits[1]=='x'?16:10;
   char*e;errno=0;long long v=strtoll(s,&e,base);
   if(errno||e!=s+strlen(s)) return 0;
   *out=(int64_t)v;
@@ -575,7 +598,7 @@ static int parse_integer_constant(const GLWASM_Text*n,unsigned bits,int64_t*out)
   size_t z;const uint8_t*p=glwasm_text_bytes(n,&z);char s[64];
   if(!numeric_text(p,z,s,sizeof(s))||!bits||bits>64)return 0;
   const char*digits=s+(s[0]=='-'||s[0]=='+'?1:0);
-  int base=digits[0]=='0'&&(digits[1]=='x'||digits[1]=='X')?16:10;
+  int base=digits[0]=='0'&&digits[1]=='x'?16:10;
   if(s[0]=='-'){
     char*end;errno=0;long long v=strtoll(s,&end,base);
     int64_t minimum=bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
@@ -593,7 +616,7 @@ static int parse_u32(const GLWASM_Text*n,uint32_t*out){int64_t v;if(!parse_i64(n
 static int parse_u64(const GLWASM_Text*n,uint64_t*out){
   size_t z;const uint8_t*p=glwasm_text_bytes(n,&z);if(!p||!z||z>63)return 0;
   char s[64];if(!numeric_text(p,z,s,sizeof(s))||s[0]=='-')return 0;
-  int base=s[0]=='0'&&(s[1]=='x'||s[1]=='X')?16:10;char*e;errno=0;unsigned long long v=strtoull(s,&e,base);
+  int base=s[0]=='0'&&s[1]=='x'?16:10;char*e;errno=0;unsigned long long v=strtoull(s,&e,base);
   if(errno||e!=s+strlen(s))return 0;
   *out=(uint64_t)v;
   return 1;
@@ -602,7 +625,7 @@ static int keyed_u64(const GLWASM_Text*n,const char*key,uint64_t*out){
   size_t z;const uint8_t*p=glwasm_text_bytes(n,&z),k=strlen(key);
   if(!p||z<=k||memcmp(p,key,k)||p[k]!='=')return 0;
   char s[64];size_t nbytes=z-k-1;if(!numeric_text(p+k+1,nbytes,s,sizeof(s))||s[0]=='-')return 0;
-  int base=s[0]=='0'&&(s[1]=='x'||s[1]=='X')?16:10;char*end;errno=0;unsigned long long v=strtoull(s,&end,base);
+  int base=s[0]=='0'&&s[1]=='x'?16:10;char*end;errno=0;unsigned long long v=strtoull(s,&end,base);
   if(errno||end!=s+strlen(s))return 0;
   *out=(uint64_t)v;return 1;
 }
@@ -612,11 +635,12 @@ static int parse_float_bits(const GLWASM_Text*n,int is64,Bytes*b){
   char*s=malloc(z+1);if(!s)return 0;
   if(!numeric_text(p,z,s,z+1)){free(s);return 0;}
   int negative=s[0]=='-',positive=s[0]=='+';const char*word=s+(negative||positive?1:0);
+  if(!hex_float_syntax(s)){free(s);return 0;}
   if(word[0]=='.'){free(s);return 0;}
   if(!strncmp(word,"nan",3)){
     uint64_t bits;const uint64_t sign=negative?(is64?UINT64_C(1)<<63:UINT64_C(1)<<31):0;
     if(word[3]==0)bits=is64?(UINT64_C(0x7ff8000000000000)|sign):(UINT64_C(0x7fc00000)|sign);
-    else if(word[3]==':'&&word[4]=='0'&&(word[5]=='x'||word[5]=='X')){
+    else if(word[3]==':'&&word[4]=='0'&&word[5]=='x'){
       char*end;errno=0;unsigned long long payload=strtoull(word+4,&end,16);
       uint64_t mask=is64?UINT64_C(0x000fffffffffffff):UINT64_C(0x007fffff);
       if(errno||end!=word+strlen(word)||payload==0||payload>mask){free(s);return 0;}

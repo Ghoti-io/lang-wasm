@@ -369,29 +369,8 @@ static int read_heap(Reader * r, GLWASM_ValType * t, int nullable) {
   if (!read_s33(r, &idx)) {
     return 0;
   }
-  /* Explicit heap types use signed s33 encodings. Keep the function,
-   * extern, and exception heaps in the validator's supported set; parse GC
-   * heap types so the module can be classified as deferred instead of bad
-   * binary. */
-  switch (idx) {
-    case -16: heap = GLWASM_HT_FUNC; break;
-    case -17: heap = GLWASM_HT_EXTERN; break;
-    case -23: heap = GLWASM_HT_EXN; break;
-    case -18: heap = GLWASM_HT_ANY; r->deferred = 1; break;
-    case -19: heap = GLWASM_HT_EQ; r->deferred = 1; break;
-    case -20: heap = GLWASM_HT_I31; r->deferred = 1; break;
-    case -21: heap = GLWASM_HT_STRUCT; r->deferred = 1; break;
-    case -22: heap = GLWASM_HT_ARRAY; r->deferred = 1; break;
-    default: heap = GLWASM_HT_NONE; break;
-  }
-  if (heap != GLWASM_HT_NONE) {
-    t->kind = GLWASM_VK_REF;
-    t->nullable = (uint8_t)nullable;
-    t->heap = heap;
-    t->index = 0;
-    if (!ref_in_scope(t)) r->deferred = 1;
-    return 1;
-  }
+  /* Abstract heap types are single-byte encodings and were handled above.
+   * The signed s33 form here is reserved for nonnegative type indices. */
   if (idx < 0) {
     return fail(r, GLWASM_ERR_CORRUPT);
   }

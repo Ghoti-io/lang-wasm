@@ -363,6 +363,7 @@ check-edges: $(APP_DIR)/$(TARGET) ## Fail on a dependency other than cutil
 	@tools/check-edges.sh --links $(APP_DIR)
 
 check-wast-corpus: ## Fail on corpus drift or an incomplete file classification
+	@python3 tools/test-check-wast-corpus.py
 	@python3 tools/check-wast-corpus.py --metadata ../runtime-jit/tools/wasm \
 		--corpus ../runtime-jit/third_party/wasm-spec \
 		--classification tests/data-wast-classification.tsv \

@@ -94,7 +94,13 @@ GLWASM_API GLWASM_Result glwasm_module_decode(
     GLWASM_Module * * out_module);
 
 /**
- * @brief Free a module from ::glwasm_module_decode.
+ * @brief Release the caller's reference to a module.
+ *
+ * A live runtime retains the module, so it remains usable until its final
+ * runtime is destroyed. The module and its compiled-code cache are freed
+ * after the caller and every runtime have released their references.
+ * Callers must synchronize this release with operations that are beginning
+ * to use the module pointer.
  *
  * @param module The module, or NULL.
  */

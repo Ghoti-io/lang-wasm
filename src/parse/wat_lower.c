@@ -3,9 +3,10 @@
  * Copyright (C) 2026 Corey Pennycuff
  */
 #include <ghoti.io/lang-wasm/parse.h>
+#include <ghoti.io/lang-wasm/policy.h>
+#include "wat_lower_internal.h"
 
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
@@ -651,8 +652,8 @@ static int parse_float_bits(const GLWASM_Text*n,int is64,Bytes*b){
     return 1;
   }
   char*end;errno=0;
-  if(is64){double x=strtod(s,&end);uint64_t bits;memcpy(&bits,&x,sizeof(bits));if(end!=s+strlen(s)||(errno==ERANGE&&isinf(x))){free(s);return 0;}free(s);for(unsigned i=0;i<8;i++)if(!put(b,(uint8_t)(bits>>(8*i))))return 0;}
-  else {float x=strtof(s,&end);uint32_t bits;memcpy(&bits,&x,sizeof(bits));if(end!=s+strlen(s)||(errno==ERANGE&&isinf(x))){free(s);return 0;}free(s);for(unsigned i=0;i<4;i++)if(!put(b,(uint8_t)(bits>>(8*i))))return 0;}
+  if(is64){double x=strtod(s,&end);uint64_t bits;memcpy(&bits,&x,sizeof(bits));if(end!=s+strlen(s)||(errno==ERANGE&&(x==HUGE_VAL||x==-HUGE_VAL))){free(s);return 0;}free(s);for(unsigned i=0;i<8;i++)if(!put(b,(uint8_t)(bits>>(8*i))))return 0;}
+  else {float x=strtof(s,&end);uint32_t bits;memcpy(&bits,&x,sizeof(bits));if(end!=s+strlen(s)||(errno==ERANGE&&(x==HUGE_VAL||x==-HUGE_VAL))){free(s);return 0;}free(s);for(unsigned i=0;i<4;i++)if(!put(b,(uint8_t)(bits>>(8*i))))return 0;}
   return 1;
 }
 static void numeric_error(GLWASM_ParseError*e,const GLWASM_Text*n){
@@ -1041,12 +1042,20 @@ static int saturating_op(const char*n,uint32_t*sub){
   for(uint32_t i=0;i<8;i++)if(!strcmp(n,names[i])){*sub=i;return 1;}
   return 0;
 }
-static int local_name_add(NameRef*refs,size_t*count,size_t capacity,
-    const GLWASM_Text*name,uint32_t index){
-  if(!named_atom(name))return 1;
-  if(*count>=capacity)return 0;
-  refs[(*count)++]=(NameRef){name,index};
-  return 1;
+static GLWASM_Result local_name_add(NameRef**refs,size_t*count,
+    size_t*capacity,size_t limit,const GLWASM_Text*name,uint32_t index){
+  if(!named_atom(name))return GLWASM_OK;
+  if(*count>=limit)return GLWASM_ERR_LIMIT;
+  if(*count==*capacity){
+    size_t next=*capacity?*capacity*2:4;
+    if(next<*capacity||next>SIZE_MAX/sizeof(**refs))return GLWASM_ERR_LIMIT;
+    if(next>limit)next=limit;
+    NameRef*grown=realloc(*refs,next*sizeof(**refs));
+    if(!grown)return GLWASM_ERR_OOM;
+    *refs=grown;*capacity=next;
+  }
+  (*refs)[(*count)++]=(NameRef){name,index};
+  return GLWASM_OK;
 }
 static int memory_op(const uint8_t*p,size_t z,uint8_t*op,uint32_t*align){
   static const struct{const char*n;uint8_t op,align;}m[]={
@@ -1422,14 +1431,18 @@ static int instruction(Bytes*b,const GLWASM_Text*n,GLWASM_ParseError*e,const Nam
 
 static GLWASM_Result wat_module_parse_impl(const uint8_t*s,size_t n,
     const GLWASM_Limits*limits,const GLWASM_Allocator*a,GLWASM_ParseError*e,
-    GLWASM_Module**out,int strip_annotations){
+    GLWASM_Module**out,int strip_annotations,uint8_t**out_binary,
+    size_t*out_binary_length){
   GLWASM_Text*tree=NULL;uint8_t*cleaned=NULL;GLWASM_Result r;const char*phase="module scan";Bytes module={0},types={0},imports={0},funcs={0},tables={0},mems={0},globals={0},elems={0},code={0},datas={0},exports={0},tags={0};
   const GLWASM_Text*root,*mod;size_t nf=0,nimports=0,nallimports=0,ntypefields=0,nimplicit=0,ncalltypes=0,ntyperefs=0;
   const GLWASM_Text*start_form=NULL;
   size_t ntables=0,nmems=0,nglobals=0,nelems=0,ndatas=0,nmemimports=0,ntableimports=0,nglobalimports=0,ntagdefs=0,ntagimports=0,ntagimplicit=0;uint32_t nexports=0;
   NameRef*fnames=NULL,*typenames=NULL,*localrefs=NULL,*globalrefs=NULL,*tagrefs=NULL,*tablerefs=NULL,*memoryrefs=NULL,*blockrefs=NULL,*elemrefs=NULL,*datarefs=NULL;TagInfo*taginfos=NULL;size_t named=0,typenamed=0,nlocalrefs=0,nglobalrefs=0,ntagrefs=0,ntablerefs=0,nmemoryrefs=0,nblockrefs=0,nelemrefs=0,ndatarefs=0,blockref_capacity=0;
-  size_t localref_capacity=limits?limits->locals:1000;
-  if(!out||(!s&&n))return GLWASM_ERR_INVALID;
+  size_t localref_capacity=0,localref_limit=limits?limits->locals:1000;
+  if(!out||(!s&&n)||(out_binary&&!out_binary_length)||
+      (!out_binary&&out_binary_length))return GLWASM_ERR_INVALID;
+  if(out_binary)*out_binary=NULL;
+  if(out_binary_length)*out_binary_length=0;
   if(!valid_wat_source(s,n,e))return GLWASM_ERR_CORRUPT;
   if(strip_annotations)cleaned=strip_wat_annotations(s,n);
   else {cleaned=malloc(n?n:1);if(cleaned&&n)memcpy(cleaned,s,n);}
@@ -1657,9 +1670,7 @@ unsupported_import:
     uint32_t fi=0;
     for(size_t i=first_field;i<glwasm_text_size(root);i++){
       const GLWASM_Text*f=at(root,i);if(!atom(at(f,0),"func")||inline_import(f))continue;
-      free(localrefs);localrefs=calloc(localref_capacity?localref_capacity:1,sizeof(*localrefs));
-      nlocalrefs=0;
-      if(!localrefs){r=GLWASM_ERR_OOM;goto done;}
+      free(localrefs);localrefs=NULL;nlocalrefs=0;localref_capacity=0;
       const GLWASM_Text*tu=type_use(f);
       Bytes body={0},locals={0};uint32_t localgroups=0;
       Bytes params={0},results={0};uint32_t nparams=0,nresults=0,nlocals=0;
@@ -1685,11 +1696,16 @@ unsupported_import:
           for(size_t k=1;k<glwasm_text_size(x);k++){
             const GLWASM_Text*name=NULL;
             if(named_atom(at(x,k))){name=at(x,k);k++;}
+            GLWASM_Result name_result=GLWASM_OK;
+            if(k<glwasm_text_size(x)&&localgroups!=UINT32_MAX)
+              name_result=local_name_add(&localrefs,&nlocalrefs,
+                  &localref_capacity,localref_limit,name,nparams+nlocals);
             if(k>=glwasm_text_size(x)||localgroups==UINT32_MAX||
-               !local_name_add(localrefs,&nlocalrefs,localref_capacity,name,nparams+nlocals)||
+               name_result!=GLWASM_OK||
                !uleb(&locals,1)||!value_type(&locals,at(x,k),typenames,ntyperefs)){
-              if(e){e->result=GLWASM_ERR_UNSUPPORTED;e->location=glwasm_text_location(x);e->message="unsupported local declaration";}
-              free(body.p);free(params.p);free(results.p);free(locals.p);r=GLWASM_ERR_UNSUPPORTED;goto done;
+              r=name_result!=GLWASM_OK?name_result:GLWASM_ERR_UNSUPPORTED;
+              if(e){e->result=r;e->location=glwasm_text_location(x);e->message=r==GLWASM_ERR_OOM?"local name allocation failed":r==GLWASM_ERR_LIMIT?"local name limit exceeded":"unsupported local declaration";}
+              free(body.p);free(params.p);free(results.p);free(locals.p);goto done;
             }
             localgroups++;
             nlocals++;
@@ -1702,10 +1718,15 @@ unsupported_import:
           for(size_t k=1;k<glwasm_text_size(x);k++){
             const GLWASM_Text*name=NULL;
             if(named_atom(at(x,k))){name=at(x,k);k++;}
+            GLWASM_Result name_result=GLWASM_OK;
+            if(k<glwasm_text_size(x)&&nparams!=UINT32_MAX)
+              name_result=local_name_add(&localrefs,&nlocalrefs,
+                  &localref_capacity,localref_limit,name,nparams);
             if(k>=glwasm_text_size(x)||nparams==UINT32_MAX||
-                !local_name_add(localrefs,&nlocalrefs,localref_capacity,name,nparams)||!value_type(&params,at(x,k),typenames,ntyperefs)){
-              if(e){e->result=GLWASM_ERR_UNSUPPORTED;e->location=glwasm_text_location(x);e->message="unsupported function parameter type";}
-          free(body.p);free(params.p);free(results.p);free(locals.p);r=GLWASM_ERR_UNSUPPORTED;goto done;
+                name_result!=GLWASM_OK||!value_type(&params,at(x,k),typenames,ntyperefs)){
+              r=name_result!=GLWASM_OK?name_result:GLWASM_ERR_UNSUPPORTED;
+              if(e){e->result=r;e->location=glwasm_text_location(x);e->message=r==GLWASM_ERR_OOM?"local name allocation failed":r==GLWASM_ERR_LIMIT?"local name limit exceeded":"unsupported function parameter type";}
+          free(body.p);free(params.p);free(results.p);free(locals.p);goto done;
             }
             nparams++;
           }
@@ -2180,13 +2201,47 @@ export_bad:
   phase="binary decode/validation";
   r=glwasm_module_decode(module.p,module.n,limits,a,NULL,out);
   if(r!=GLWASM_OK&&e){e->result=r;e->location=glwasm_text_location(mod);e->message="lowered WAT module failed binary validation";}
+  if(r==GLWASM_OK&&out_binary){
+    uint8_t*copy=malloc(module.n?module.n:1);
+    if(!copy){glwasm_module_destroy(*out);*out=NULL;r=GLWASM_ERR_OOM;}
+    else{if(module.n)memcpy(copy,module.p,module.n);*out_binary=copy;*out_binary_length=module.n;}
+  }
 done:
   if(e&&r!=GLWASM_OK&&!e->message){e->result=r;e->location=(GLWASM_SourceLoc){0,1,1};e->message=phase;}
   free(cleaned);free(module.p);free(types.p);free(imports.p);free(funcs.p);free(tables.p);free(mems.p);free(globals.p);free(elems.p);free(code.p);free(datas.p);free(exports.p);free(tags.p);free(fnames);free(typenames);free(localrefs);free(globalrefs);free(tagrefs);free(tablerefs);free(memoryrefs);free(blockrefs);free(elemrefs);free(datarefs);free(taginfos);glwasm_text_destroy(tree);return r;
 }
 GLWASM_Result glwasm_wat_module_parse(const uint8_t*s,size_t n,
     const GLWASM_Limits*l,const GLWASM_Allocator*a,GLWASM_ParseError*e,
-    GLWASM_Module**out){return wat_module_parse_impl(s,n,l,a,e,out,1);}
+    GLWASM_Module**out){return wat_module_parse_impl(s,n,l,a,e,out,1,NULL,NULL);}
+GLWASM_Result glwasm_wat_module_parse_with_policy(const uint8_t*s,size_t n,
+    const GLWASM_Policy*policy,const GLWASM_Allocator*a,GLWASM_ParseError*e,
+    GLWASM_Module**out){
+  if(!policy||!out)return GLWASM_ERR_INVALID;
+  *out=NULL;
+  uint8_t*binary=NULL;size_t binary_length=0;
+  GLWASM_Result result=glwasm_wat_module_lower_binary(s,n,&policy->limits,a,e,
+      &binary,&binary_length);
+  if(result==GLWASM_OK){
+    GLWASM_Failure failure={0};
+    result=glwasm_module_decode_with_policy(binary,binary_length,policy,a,
+        &failure,out);
+    if(result!=GLWASM_OK&&e){e->result=result;
+      e->location=(GLWASM_SourceLoc){0,1,1};
+      e->message="lowered WAT module failed policy validation";}
+  }
+  free(binary);
+  return result;
+}
 GLWASM_Result glwasm_wat_module_parse_verbatim(const uint8_t*s,size_t n,
     const GLWASM_Limits*l,const GLWASM_Allocator*a,GLWASM_ParseError*e,
-    GLWASM_Module**out){return wat_module_parse_impl(s,n,l,a,e,out,0);}
+    GLWASM_Module**out){return wat_module_parse_impl(s,n,l,a,e,out,0,NULL,NULL);}
+GLWASM_Result glwasm_wat_module_lower_binary(const uint8_t*s,size_t n,
+    const GLWASM_Limits*l,const GLWASM_Allocator*a,GLWASM_ParseError*e,
+    uint8_t**out_binary,size_t*out_binary_length){
+  GLWASM_Module*module=NULL;
+  if(!out_binary||!out_binary_length)return GLWASM_ERR_INVALID;
+  GLWASM_Result r=wat_module_parse_impl(s,n,l,a,e,&module,1,out_binary,
+      out_binary_length);
+  glwasm_module_destroy(module);
+  return r;
+}

@@ -1,0 +1,11 @@
+# workload<TAB>module<TAB>field<TAB>exact WebAssembly function signature
+# Lua's deterministic reactor needs these wasi-sdk 34 libc imports for its
+# allocator/SJLJ runtime boundary. Test hosts resolve them as fail-closed stubs;
+# no callback is expected during the corpus workload.
+lua	wasi_snapshot_preview1	clock_time_get	(i32,i64,i32)->(i32)
+lua	wasi_snapshot_preview1	fd_close	(i32)->(i32)
+lua	wasi_snapshot_preview1	fd_prestat_get	(i32,i32)->(i32)
+lua	wasi_snapshot_preview1	fd_prestat_dir_name	(i32,i32,i32)->(i32)
+lua	wasi_snapshot_preview1	fd_seek	(i32,i64,i32,i32)->(i32)
+lua	wasi_snapshot_preview1	fd_write	(i32,i32,i32,i32)->(i32)
+lua	wasi_snapshot_preview1	proc_exit	(i32)->()

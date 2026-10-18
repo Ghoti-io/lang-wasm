@@ -8,6 +8,7 @@
 #include <ghoti.io/lang-wasm/parse.h>
 #include <ghoti.io/lang-wasm/script.h>
 #include <ghoti.io/lang-wasm/decode.h>
+#include <ghoti.io/lang-wasm/policy.h>
 #include "module_internal.h"
 #include "runtime/runtime.h"
 #include <ghoti.io/lang-wasm/parse.h>
@@ -989,7 +990,8 @@ TEST(WastAdapter, HostCallbackPauseUsesResumeContinuationExactlyOnce) {
   HostPauseFixture state;
   const GLWASM_HostImport binding={.module="host.v1",.field="step",
       .function=host_pause_once,.resume=host_resume_once,.user=&state,
-      .kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={}};
+      .kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={},
+      .function_results=nullptr,.resume_results=nullptr};
   const std::string source="(module (import \"host.v1\" \"step\" (func $step (result i32)))"
       " (func (export \"run\") (result i32) (call $step)))";
   GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result result;
@@ -1175,8 +1177,15 @@ TEST(WasmExceptions, FuelAndDepthLimitsBypassCatchAll) {
   ASSERT_EQ(status,GLWASM_OK)<<link.reason;
   uint64_t result=0;
   ASSERT_EQ(glwasm_runtime_set_test_limits(fuel_runtime,12,64,0),GLWASM_OK);
-  EXPECT_EQ(glwasm_runtime_invoke_export(fuel_runtime,"fuel",nullptr,0,&result),
-      GLWASM_ERR_LIMIT);
+  const GLWASM_Result fuel_result=glwasm_runtime_invoke_export(fuel_runtime,
+      "fuel",nullptr,0,&result);
+  GLWASM_TestRuntimeFailureInfo fuel_failure{};
+  ASSERT_EQ(glwasm_runtime_test_failure_info(fuel_runtime,1,&fuel_failure),
+      GLWASM_OK);
+  EXPECT_EQ(fuel_result,GLWASM_ERR_LIMIT);
+  EXPECT_EQ(fuel_failure.run_error,GLWASM_ERR_LIMIT);
+  EXPECT_EQ(fuel_failure.core_result,GRCORE_ERR_LIMIT);
+  EXPECT_EQ(fuel_failure.outcome,GRCORE_OUTCOME_FINISHED);
   glwasm_runtime_destroy(fuel_runtime);
 
   GLWASM_Runtime *depth_runtime=nullptr;
@@ -1201,8 +1210,9 @@ TEST(WasmExceptions, ExceptionAllocationLimitBypassesCatchAll) {
   GLWASM_Runtime *runtime=parse_and_link(source,nullptr,0,&module,&link,&status);
   ASSERT_EQ(status,GLWASM_OK)<<link.reason;
   uint64_t result=0;
-  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"run",nullptr,0,&result),
-      GLWASM_ERR_LIMIT);
+  const GLWASM_Result limit_result=glwasm_runtime_invoke_export(runtime,
+      "run",nullptr,0,&result);
+  EXPECT_EQ(limit_result,GLWASM_ERR_LIMIT);
   glwasm_runtime_destroy(runtime);glwasm_module_destroy(module);
 }
 
@@ -1231,9 +1241,11 @@ TEST(WasmExceptions, ImportedTagsMatchByHostIdentity) {
   GLWASM_HostTag host_tag{UINT64_C(0xabc123), parameters, 1};
   const GLWASM_HostImport imports[]={
       {.module="host.v1",.field="first",.function=nullptr,.resume=nullptr,
-       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&host_tag}},
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&host_tag},
+       .function_results=nullptr,.resume_results=nullptr},
       {.module="host.v1",.field="second",.function=nullptr,.resume=nullptr,
-       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&host_tag}}};
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&host_tag},
+       .function_results=nullptr,.resume_results=nullptr}};
   const std::string source=
       "(module"
       " (import \"host.v1\" \"first\" (tag $first (param i32)))"
@@ -1260,9 +1272,11 @@ TEST(WasmExceptions, ImportedTagIdentityRequiresMatchingPayloadSignature) {
   GLWASM_HostTag second_tag{UINT64_C(0xabc123), second_parameter, 1};
   const GLWASM_HostImport imports[]={
       {.module="host.v1",.field="first",.function=nullptr,.resume=nullptr,
-       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&first_tag}},
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&first_tag},
+       .function_results=nullptr,.resume_results=nullptr},
       {.module="host.v1",.field="second",.function=nullptr,.resume=nullptr,
-       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&second_tag}}};
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_TAG,.resource={.tag=&second_tag},
+       .function_results=nullptr,.resume_results=nullptr}};
   const std::string source=
       "(module"
       " (import \"host.v1\" \"first\" (tag $first (param i32)))"
@@ -1377,10 +1391,12 @@ TEST(WastAdapter, MemoryBulkFillPausesAfterAChunkAndResumesRemainingBytesOnce) {
       bulk_pause_memory_end,host_memory_grow,&memory};
   const GLWASM_HostImport imports[]={
       {.module="host.v1",.field="arm",.function=host_capture_bulk_context,
-       .resume=nullptr,.user=&memory.pause,.kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={}},
+       .resume=nullptr,.user=&memory.pause,.kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={},
+       .function_results=nullptr,.resume_results=nullptr},
       {.module="host.v1",.field="mem",.function=nullptr,.resume=nullptr,.user=nullptr,
        .kind=GLWASM_HOST_IMPORT_MEMORY,
-       .resource={.memory=&provider}}};
+       .resource={.memory=&provider},.function_results=nullptr,
+       .resume_results=nullptr}};
   const std::string source="(module (import \"host.v1\" \"arm\" (func $arm))"
       " (import \"host.v1\" \"mem\" (memory 1 1))"
       " (func (export \"run\") (call $arm)"
@@ -1407,10 +1423,12 @@ TEST(WastAdapter, TableBulkFillPausesAfterAChunkAndResumesRemainingEntriesOnce) 
       host_table_grow,GLWASM_HOST_EXTERNREF,bulk_pause_reference_check,&table};
   const GLWASM_HostImport imports[]={
       {.module="host.v1",.field="arm",.function=host_capture_bulk_context,
-       .resume=nullptr,.user=&table.pause,.kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={}},
+       .resume=nullptr,.user=&table.pause,.kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={},
+       .function_results=nullptr,.resume_results=nullptr},
       {.module="host.v1",.field="tab",.function=nullptr,.resume=nullptr,.user=nullptr,
        .kind=GLWASM_HOST_IMPORT_TABLE,
-       .resource={.table=&provider}}};
+       .resource={.table=&provider},.function_results=nullptr,
+       .resume_results=nullptr}};
   const std::string source="(module (import \"host.v1\" \"arm\" (func $arm))"
       " (import \"host.v1\" \"tab\" (table 2048 externref))"
       " (func (export \"run\") (param externref) (call $arm)"
@@ -1462,7 +1480,8 @@ TEST(WastAdapter, ImportedMemoryProviderUsesShortRelocationSafeLeases) {
   HostMemoryFixture memory;memory.bytes.resize(65536);
   GLWASM_HostMemoryProvider provider{host_memory_begin,host_memory_end,host_memory_grow,&memory};
   GLWASM_HostImport binding{.module="host.v1",.field="mem",.function=nullptr,
-      .resume=nullptr,.user=nullptr,.kind=GLWASM_HOST_IMPORT_MEMORY,.resource={.memory=&provider}};
+      .resume=nullptr,.user=nullptr,.kind=GLWASM_HOST_IMPORT_MEMORY,.resource={.memory=&provider},
+      .function_results=nullptr,.resume_results=nullptr};
   GLWASM_Module *module=nullptr;GLWASM_LinkError link{};GLWASM_Result result;
   GLWASM_Runtime *runtime=parse_and_link(source,&binding,1,&module,&link,&result);
   ASSERT_EQ(result,GLWASM_OK)<<link.reason;ASSERT_NE(runtime,nullptr);
@@ -1485,7 +1504,8 @@ TEST(WastAdapter, ImportedProvidersCannotExceedDeclaredMaximums) {
       host_memory_grow,&oversized_memory};
   const GLWASM_HostImport memory_import={.module="host.v1",.field="mem",
       .function=nullptr,.resume=nullptr,.user=nullptr,
-      .kind=GLWASM_HOST_IMPORT_MEMORY,.resource={.memory=&memory_provider}};
+      .kind=GLWASM_HOST_IMPORT_MEMORY,.resource={.memory=&memory_provider},
+      .function_results=nullptr,.resume_results=nullptr};
   GLWASM_Runtime *runtime=parse_and_link(
       "(module (import \"host.v1\" \"mem\" (memory 1 1)))",
       &memory_import,1,&module,&link,&status);
@@ -1497,7 +1517,8 @@ TEST(WastAdapter, ImportedProvidersCannotExceedDeclaredMaximums) {
       host_table_grow,GLWASM_HOST_EXTERNREF,host_reference_check,&oversized_table};
   const GLWASM_HostImport table_import={.module="host.v1",.field="tab",
       .function=nullptr,.resume=nullptr,.user=nullptr,
-      .kind=GLWASM_HOST_IMPORT_TABLE,.resource={.table=&table_provider}};
+      .kind=GLWASM_HOST_IMPORT_TABLE,.resource={.table=&table_provider},
+      .function_results=nullptr,.resume_results=nullptr};
   runtime=parse_and_link(
       "(module (import \"host.v1\" \"tab\" (table 1 2 externref)))",
       &table_import,1,&module,&link,&status);
@@ -1513,9 +1534,11 @@ TEST(WastAdapter, ImportedTableAndGlobalProvidersValidateTypesAndTokens) {
   GLWASM_HostGlobal global{GLWASM_HOST_I32,1,&global_value,nullptr,nullptr};
   const GLWASM_HostImport bindings[]={
       {.module="host.v1",.field="tab",.function=nullptr,.resume=nullptr,.user=nullptr,
-       .kind=GLWASM_HOST_IMPORT_TABLE,.resource={.table=&table_provider}},
+       .kind=GLWASM_HOST_IMPORT_TABLE,.resource={.table=&table_provider},
+       .function_results=nullptr,.resume_results=nullptr},
       {.module="host.v1",.field="g",.function=nullptr,.resume=nullptr,.user=nullptr,
-       .kind=GLWASM_HOST_IMPORT_GLOBAL,.resource={.global=&global}}};
+       .kind=GLWASM_HOST_IMPORT_GLOBAL,.resource={.global=&global},
+       .function_results=nullptr,.resume_results=nullptr}};
   const std::string source="(module (import \"host.v1\" \"tab\" (table $tab 2 externref))"
       " (import \"host.v1\" \"g\" (global $g (mut i32)))"
       " (func (export \"setref\") (param externref) (i32.const 0) (local.get 0) (table.set 0))"
@@ -1536,11 +1559,22 @@ TEST(WastAdapter, ImportedTableAndGlobalProvidersValidateTypesAndTokens) {
   EXPECT_EQ(table.elements[1],0u);
   EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"isnull",nullptr,0,&value),GLWASM_OK);
   EXPECT_EQ(value,0u);
+  ASSERT_EQ(glwasm_runtime_test_set_jit_mode(runtime,
+      GLWASM_TEST_JIT_REQUIRE),GLWASM_OK);
   const uint64_t global_arg[]={42};
   EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"setglobal",global_arg,1,&value),GLWASM_OK);
   EXPECT_EQ(global_value,42u);
   EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"getglobal",nullptr,0,&value),GLWASM_OK);
   EXPECT_EQ(value,42u);
+  const uint64_t negative_global_arg[]={UINT32_MAX};
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"setglobal",
+      negative_global_arg,1,&value),GLWASM_OK);
+  EXPECT_EQ(global_value,UINT32_MAX);
+  global_value=84;
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"getglobal",nullptr,0,&value),GLWASM_OK);
+  EXPECT_EQ(value,84u);
+  ASSERT_EQ(glwasm_runtime_test_set_jit_mode(runtime,
+      GLWASM_TEST_JIT_INTERPRETER),GLWASM_OK);
   ASSERT_EQ(glwasm_runtime_request_test_pause(runtime),GLWASM_OK);
   EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"isnull",nullptr,0,&value),GLWASM_ERR_PAUSED);
   GLWASM_Snapshot *unsupported_snapshot=nullptr;
@@ -1551,7 +1585,7 @@ TEST(WastAdapter, ImportedTableAndGlobalProvidersValidateTypesAndTokens) {
   GLWASM_HostGlobal wrong{GLWASM_HOST_I64,1,&global_value,nullptr,nullptr};
   const GLWASM_HostImport mismatch={.module="host.v1",.field="g",
       .function=nullptr,.resume=nullptr,.user=nullptr,.kind=GLWASM_HOST_IMPORT_GLOBAL,
-      .resource={.global=&wrong}};
+      .resource={.global=&wrong},.function_results=nullptr,.resume_results=nullptr};
   const std::string global_source="(module (import \"host.v1\" \"g\" (global (mut i32))))";
   runtime=parse_and_link(global_source,&mismatch,1,&module,&link,&result);
   EXPECT_EQ(result,GLWASM_ERR_LINK);EXPECT_EQ(runtime,nullptr);
@@ -1561,7 +1595,8 @@ TEST(WastAdapter, ImportedTableAndGlobalProvidersValidateTypesAndTokens) {
       host_table_grow,GLWASM_HOST_FUNCREF,nullptr,&wrong_table_state};
   const GLWASM_HostImport table_mismatch={.module="host.v1",.field="tab",
       .function=nullptr,.resume=nullptr,.user=nullptr,.kind=GLWASM_HOST_IMPORT_TABLE,
-      .resource={.table=&wrong_table}};
+      .resource={.table=&wrong_table},.function_results=nullptr,
+      .resume_results=nullptr};
   const std::string table_source="(module (import \"host.v1\" \"tab\" (table 2 externref)))";
   runtime=parse_and_link(table_source,&table_mismatch,1,&module,&link,&result);
   EXPECT_EQ(result,GLWASM_ERR_LINK);EXPECT_EQ(runtime,nullptr);
@@ -1570,36 +1605,70 @@ TEST(WastAdapter, ImportedTableAndGlobalProvidersValidateTypesAndTokens) {
 }
 
 TEST(WastAdapter, PublicHostAPIRequiresExplicitVersionedImportGrant) {
-  const std::string source=
-      "(module (import \"tang.v1\" \"sum\""
-      " (func $sum (param i32 i32) (result i32)))"
-      " (func (export \"run\") (param i32 i32) (result i32)"
-      "   (local.get 0) (local.get 1) (call $sum)))";
+  auto imported_sum = [](const char *version) {
+    std::vector<uint8_t> wasm={
+      0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+      0x01,0x07,0x01,0x60,0x02,0x7f,0x7f,0x01,0x7f,
+      0x02,0x0f,0x01,0x07,
+      static_cast<uint8_t>(version[0]),static_cast<uint8_t>(version[1]),
+      static_cast<uint8_t>(version[2]),static_cast<uint8_t>(version[3]),
+      static_cast<uint8_t>(version[4]),static_cast<uint8_t>(version[5]),
+      static_cast<uint8_t>(version[6]),
+      0x03,'s','u','m',0x00,0x00};
+    return wasm;
+  };
+  std::vector<uint8_t> wasm=imported_sum("tang.v1");
+  GLWASM_Policy policy{};
+  ASSERT_EQ(glwasm_policy_preset(GLWASM_POLICY_UNTRUSTED,&policy),GLWASM_OK);
   GLWASM_Module *module=nullptr;
-  GLWASM_ParseError parse_error{};
-  ASSERT_EQ(glwasm_wat_module_parse(
-      reinterpret_cast<const uint8_t *>(source.data()),source.size(),
-      nullptr,nullptr,&parse_error,&module),GLWASM_OK)
-      << parse_error.message;
+  ASSERT_EQ(glwasm_module_decode_with_policy(wasm.data(),wasm.size(),&policy,
+      nullptr,nullptr,&module),GLWASM_OK);
   GLWASM_Runtime *runtime=nullptr;
   GLWASM_LinkError link_error{};
-  EXPECT_EQ(glwasm_runtime_create_with_imports(module,nullptr,0,1,
+  const GLWASM_HostImport imports[]={
+      {.module="tang.v1",.field="sum",.function=host_add,.resume=nullptr,
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={},
+       .function_results=nullptr,.resume_results=nullptr}};
+  EXPECT_EQ(glwasm_runtime_create_with_imports(module,imports,1,1,
       &link_error,&runtime),GLWASM_ERR_LINK);
   EXPECT_EQ(link_error.reason,GLWASM_LINK_UNRESOLVED);
   EXPECT_EQ(link_error.module,std::string("tang.v1"));
   ASSERT_EQ(runtime,nullptr);
+  glwasm_module_destroy(module);
 
-  const GLWASM_HostImport imports[]={
-      {.module="tang.v1",.field="sum",.function=host_add,.resume=nullptr,
-       .user=nullptr,.kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={}}};
+  policy.allow_tang_v1_imports=1;
+  ASSERT_EQ(glwasm_module_decode_with_policy(wasm.data(),wasm.size(),&policy,
+      nullptr,nullptr,&module),GLWASM_OK);
+  const GLWASM_HostImport wrong_field[]={
+      {.module="tang.v1",.field="other",.function=host_add,.resume=nullptr,
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={},
+       .function_results=nullptr,.resume_results=nullptr}};
+  EXPECT_EQ(glwasm_runtime_create_with_imports(module,wrong_field,1,1,
+      &link_error,&runtime),GLWASM_ERR_LINK);
+  EXPECT_EQ(link_error.reason,GLWASM_LINK_UNRESOLVED);
+  ASSERT_EQ(runtime,nullptr);
+  GLWASM_Runtime *linked=nullptr;
   ASSERT_EQ(glwasm_runtime_create_with_imports(module,imports,1,1,
-      &link_error,&runtime),GLWASM_OK);
+      &link_error,&linked),GLWASM_OK);
   const uint64_t arguments[]={40,2};
   uint64_t result=0;
-  EXPECT_EQ(glwasm_runtime_invoke_export(runtime,"run",arguments,2,&result),
-      GLWASM_OK);
+  EXPECT_EQ(glwasm_runtime_invoke(linked,0,arguments,2,&result),GLWASM_OK);
   EXPECT_EQ(result,UINT64_C(42));
-  glwasm_runtime_destroy(runtime);
+  glwasm_runtime_destroy(linked);
+  glwasm_module_destroy(module);
+
+  wasm=imported_sum("tang.v2");
+  ASSERT_EQ(glwasm_module_decode_with_policy(wasm.data(),wasm.size(),&policy,
+      nullptr,nullptr,&module),GLWASM_OK);
+  GLWASM_HostImport wrong_version[]={
+      {.module="tang.v2",.field="sum",.function=host_add,.resume=nullptr,
+       .user=nullptr,.kind=GLWASM_HOST_IMPORT_FUNCTION,.resource={},
+       .function_results=nullptr,.resume_results=nullptr}};
+  EXPECT_EQ(glwasm_runtime_create_with_imports(module,wrong_version,1,1,
+      &link_error,&runtime),GLWASM_ERR_LINK);
+  EXPECT_EQ(link_error.reason,GLWASM_LINK_UNRESOLVED);
+  EXPECT_EQ(link_error.module,std::string("tang.v2"));
+  ASSERT_EQ(runtime,nullptr);
   glwasm_module_destroy(module);
 }
 
@@ -1789,6 +1858,8 @@ TEST(WastCorpus, EveryPinnedFileParsesAndEveryCommandIsRecognized) {
          deferred_wat_modules = 0;
   size_t wat_modules_in_scope = 0, wat_in_scope_passed = 0;
   size_t execution_checked = 0, execution_passed = 0, deferred_invokes=0;
+  size_t jit_execution_checked=0,jit_execution_passed=0;
+  size_t jit_compiled_entries=0,jit_compiled_returns=0,jit_side_exits=0;
   size_t deferred_runtime_unsupported=0,deferred_runtime_init_traps=0;
   std::vector<std::string> wat_module_failures;
   std::map<std::string, size_t> skips;
@@ -1847,8 +1918,50 @@ TEST(WastCorpus, EveryPinnedFileParsesAndEveryCommandIsRecognized) {
     if (script) {
       GLWASM_Module *active_module=nullptr;
       GLWASM_Runtime *active_runtime=nullptr;
+      GLWASM_Runtime *active_jit_runtime=nullptr;
       size_t executed_assertions=0;
       size_t executed_assertions_passed=0;
+      size_t jit_executed_assertions=0;
+      size_t jit_executed_assertions_passed=0;
+      auto audit_jit_module = [&]() {
+        if(active_module&&active_jit_runtime&&active_module->jit_cache){
+          std::vector<uint8_t> observed(active_module->nfuncs);
+          uint32_t required=0;
+          if(glwasm_runtime_test_observed_functions(active_jit_runtime,
+              observed.empty()?nullptr:observed.data(),
+              static_cast<uint32_t>(observed.size()),&required)!=GLWASM_OK||
+              required!=active_module->nfuncs){
+            failures.push_back(relative+": could not read bounded guest-function observations");
+            return;
+          }
+          for(uint32_t fi=0;fi<active_module->nfuncs;fi++){
+            GLWASM_JitCacheStats stats{};
+            if(glwasm_runtime_test_jit_stats(active_jit_runtime,fi,&stats)
+                !=GLWASM_OK)continue;
+            jit_compiled_entries+=stats.compiled_entries;
+            jit_compiled_returns+=stats.exit_counts[GLWASM_JIT_EXIT_RETURN];
+            jit_side_exits+=stats.guest_visible_exits;
+          }
+          for(uint32_t fi=0;fi<active_module->nfuncs;fi++){
+            if(!observed[fi])continue;
+            GLWASM_JitCacheStats stats{};
+            if(glwasm_runtime_test_jit_stats(active_jit_runtime,fi,&stats)
+                !=GLWASM_OK){
+              failures.push_back(relative+": missing JIT statistics for exercised function "+
+                  std::to_string(fi));
+              continue;
+            }
+            size_t refusals=stats.signature_refusal_count;
+            for(uint64_t count:stats.refusal_counts)refusals+=count;
+            if(stats.compile_attempts==0&&refusals==0)
+              failures.push_back(relative+": exercised function "+
+                  std::to_string(fi)+" has neither a JIT compile attempt nor a named refusal");
+            if(stats.compile_successes==0&&refusals==0)
+              failures.push_back(relative+": exercised function "+
+                  std::to_string(fi)+" has no compiled code or counted refusal");
+          }
+        }
+      };
       for (size_t i = 0; i < glwasm_script_size(script); ++i) {
         GLWASM_Command command{};
         ASSERT_EQ(glwasm_script_at(script, i, &command), GLWASM_OK);
@@ -1894,6 +2007,8 @@ TEST(WastCorpus, EveryPinnedFileParsesAndEveryCommandIsRecognized) {
                 reinterpret_cast<const uint8_t *>(form.data()), form.size(),
                 &wat_limits, nullptr, &wat_error, &lowered);
             if (wat_result == GLWASM_OK) {
+              audit_jit_module();
+              if(active_jit_runtime){glwasm_runtime_destroy(active_jit_runtime);active_jit_runtime=nullptr;}
               if(active_runtime){glwasm_runtime_destroy(active_runtime);active_runtime=nullptr;}
               if(active_module){glwasm_module_destroy(active_module);active_module=nullptr;}
               ++wat_modules_passed;
@@ -1907,6 +2022,34 @@ TEST(WastCorpus, EveryPinnedFileParsesAndEveryCommandIsRecognized) {
                   else if(runtime_result==GLWASM_ERR_VALIDATE||runtime_result==GLWASM_ERR_GUEST)++deferred_runtime_init_traps;
                   else failures.push_back(relative+":"+std::to_string(command.location.line)+": runtime creation failed with result "+std::to_string(runtime_result));
                   glwasm_module_destroy(active_module);active_module=nullptr;active_runtime=nullptr;
+                }else{
+                  const GLWASM_Result jit_runtime_result=glwasm_runtime_create(
+                      active_module,&active_jit_runtime);
+                  if(jit_runtime_result!=GLWASM_OK){
+                    failures.push_back(relative+":"+
+                        std::to_string(command.location.line)+
+                        ": JIT runtime creation failed with result "+
+                        std::to_string(jit_runtime_result));
+                    glwasm_runtime_destroy(active_runtime);active_runtime=nullptr;
+                    glwasm_module_destroy(active_module);active_module=nullptr;
+                    active_jit_runtime=nullptr;
+                  }else if(glwasm_runtime_test_set_jit_mode(active_jit_runtime,
+                      GLWASM_TEST_JIT_AUTO)!=GLWASM_OK){
+                    failures.push_back(relative+":"+
+                        std::to_string(command.location.line)+
+                        ": could not enable the JIT tier");
+                    glwasm_runtime_destroy(active_jit_runtime);active_jit_runtime=nullptr;
+                    glwasm_runtime_destroy(active_runtime);active_runtime=nullptr;
+                    glwasm_module_destroy(active_module);active_module=nullptr;
+                  }else if(glwasm_runtime_test_reset_observed_functions(
+                      active_jit_runtime)!=GLWASM_OK){
+                    failures.push_back(relative+":"+
+                        std::to_string(command.location.line)+
+                        ": could not reset guest-function observations");
+                    glwasm_runtime_destroy(active_jit_runtime);active_jit_runtime=nullptr;
+                    glwasm_runtime_destroy(active_runtime);active_runtime=nullptr;
+                    glwasm_module_destroy(active_module);active_module=nullptr;
+                  }
                 }
               }
               else if(lowered)glwasm_module_destroy(lowered);
@@ -1930,9 +2073,15 @@ TEST(WastCorpus, EveryPinnedFileParsesAndEveryCommandIsRecognized) {
         if(command.kind==GLWASM_COMMAND_INVOKE){
           if(active_runtime){
             const int invoke_result=execute_invoke(active_runtime,active_module,command.syntax);
-            if(invoke_result<0)failures.push_back(relative+":"+std::to_string(command.location.line)+": in-scope invoke trapped or failed");
+            const int jit_invoke_result=execute_invoke(active_jit_runtime,
+                active_module,command.syntax);
+            if(invoke_result!=jit_invoke_result)
+              failures.push_back(relative+":"+std::to_string(command.location.line)+
+                  ": interpreter/JIT standalone invoke outcomes differ");
+            if(invoke_result<0||jit_invoke_result<0)failures.push_back(relative+":"+std::to_string(command.location.line)+": in-scope invoke trapped or failed");
             else if(invoke_result==0)++deferred_invokes;
-            if(invoke_result<=0){
+            if(invoke_result<=0||jit_invoke_result<=0){
+              glwasm_runtime_destroy(active_jit_runtime);active_jit_runtime=nullptr;
             glwasm_runtime_destroy(active_runtime);active_runtime=nullptr;
             }
           } else if(classification->second=="run") ++deferred_invokes;
@@ -2026,30 +2175,58 @@ TEST(WastCorpus, EveryPinnedFileParsesAndEveryCommandIsRecognized) {
           }
           else if(command.kind==GLWASM_COMMAND_ASSERT_RETURN){
             const int execution=execute_return_assertion(active_runtime,active_module,command);
+            const int jit_execution=execute_return_assertion(active_jit_runtime,
+                active_module,command);
+            if(execution!=jit_execution)failures.push_back(relative+":"+
+                std::to_string(command.location.line)+
+                ": interpreter/JIT assert_return outcomes differ");
             if(execution==1){++executed_assertions;++executed_assertions_passed;}
             else if(execution<0){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": executed assert_return mismatch");}
             else if(execution==2){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": assert_return invocation trapped or failed");}
             else ++pending;
+            if(jit_execution==1){++jit_executed_assertions;++jit_executed_assertions_passed;}
+            else if(jit_execution!=0){++jit_executed_assertions;failures.push_back(relative+":"+
+                std::to_string(command.location.line)+": JIT assert_return mismatch or invocation failure");}
           }
           else if(command.kind==GLWASM_COMMAND_ASSERT_TRAP){
             const int execution=execute_trap_assertion(active_runtime,active_module,command);
+            const int jit_execution=execute_trap_assertion(active_jit_runtime,
+                active_module,command);
+            if(execution!=jit_execution)failures.push_back(relative+":"+
+                std::to_string(command.location.line)+
+                ": interpreter/JIT assert_trap outcomes differ");
             if(execution==1){++executed_assertions;++executed_assertions_passed;}
             else if(execution<0){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": executed assert_trap mismatch");}
             else if(execution==2){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": assert_trap invocation failed without a Wasm trap");}
             else ++pending;
+            if(jit_execution==1){++jit_executed_assertions;++jit_executed_assertions_passed;}
+            else if(jit_execution!=0){++jit_executed_assertions;failures.push_back(relative+":"+
+                std::to_string(command.location.line)+": JIT assert_trap mismatch or invocation failure");}
           }
           else if(command.kind==GLWASM_COMMAND_ASSERT_EXCEPTION){
             const int execution=execute_exception_assertion(active_runtime,active_module,command);
+            const int jit_execution=execute_exception_assertion(active_jit_runtime,
+                active_module,command);
+            if(execution!=jit_execution)failures.push_back(relative+":"+
+                std::to_string(command.location.line)+
+                ": interpreter/JIT assert_exception outcomes differ");
             if(execution==1){++executed_assertions;++executed_assertions_passed;}
             else if(execution<0){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": executed assert_exception mismatch");}
             else if(execution==2){++executed_assertions;failures.push_back(relative+":"+std::to_string(command.location.line)+": assert_exception invocation failed without a guest exception");}
             else ++pending;
+            if(jit_execution==1){++jit_executed_assertions;++jit_executed_assertions_passed;}
+            else if(jit_execution!=0){++jit_executed_assertions;failures.push_back(relative+":"+
+                std::to_string(command.location.line)+": JIT assert_exception mismatch or invocation failure");}
           }
           else ++pending;
         }
       }
       execution_checked += executed_assertions;
       execution_passed += executed_assertions_passed;
+      jit_execution_checked+=jit_executed_assertions;
+      jit_execution_passed+=jit_executed_assertions_passed;
+      audit_jit_module();
+      if(active_jit_runtime)glwasm_runtime_destroy(active_jit_runtime);
       if(active_runtime)glwasm_runtime_destroy(active_runtime);
       if(active_module)glwasm_module_destroy(active_module);
       glwasm_script_destroy(script);
@@ -2101,12 +2278,23 @@ TEST(WastCorpus, EveryPinnedFileParsesAndEveryCommandIsRecognized) {
   std::cout << "execution assertions executed=" << execution_passed << "/"
             << execution_checked << " pending=" << pending
             << " deferred-invokes=" << deferred_invokes << '\n';
+  std::cout << "JIT differential assertions executed=" << jit_execution_passed
+            << "/" << jit_execution_checked << " compiled-entries="
+            << jit_compiled_entries << " compiled-returns="
+            << jit_compiled_returns << " guest-visible-exits="
+            << jit_side_exits << '\n';
   EXPECT_EQ(execution_checked, expected_execution_assertions)
       << "pinned supported execution coverage changed; review the supported set explicitly";
   EXPECT_EQ(deferred_invokes, expected_deferred_invokes)
       << "pinned deferred standalone invokes changed; review the boundary explicitly";
   EXPECT_EQ(execution_passed, execution_checked)
       << "every executed supported assertion must pass";
+  EXPECT_EQ(jit_execution_checked,execution_checked)
+      << "the JIT tier must execute every supported interpreter assertion";
+  EXPECT_EQ(jit_execution_passed,jit_execution_checked)
+      << "every supported execution assertion must pass in both tiers";
+  EXPECT_GT(jit_compiled_returns,0u)
+      << "the pinned supported suite must execute compiled Wasm code";
   for (const auto & failure : failures)
     ADD_FAILURE() << failure;
   EXPECT_EQ(parsed_files, files.size()) << "all pinned WAST files must parse";

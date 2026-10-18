@@ -4,6 +4,8 @@ build
 # Debug artifacts (GDB scripts, captured stderr, sanity/trace dumps)
 *.gdb
 *.txt
+!tests/real-corpus/licenses/SQLite-3.54.1-notice.txt
+!tests/real-corpus/licenses/zlib-1.3.2-LICENSE.txt
 
 # IDE / CTest run output (not used by project Makefile)
 Testing

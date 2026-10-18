@@ -33,6 +33,8 @@
 
 #include <ghoti.io/lang-wasm/decode.h>
 #include <ghoti.io/lang-wasm/policy.h>
+#include <ghoti.io/runtime-core/a/code_pages.h>
+#include "jit/cache_internal.h"
 
 #include <stdint.h>
 
@@ -125,7 +127,12 @@ typedef struct GLWASM_Func {
   uint8_t imported;
   uint8_t is_const;
   uint32_t nparams;
+  /* Total local index space, including parameters and declared locals. */
   uint32_t nlocals;
+  /* Verified maximum operand-stack height for this expression body. */
+  uint32_t max_stack;
+  /* Verified maximum nested control depth, excluding the function label. */
+  uint32_t max_control_depth;
   GLWASM_ValType * locals;
   GLWASM_Instr * ins;
   uint32_t nins;
@@ -179,7 +186,22 @@ typedef struct GLWASM_Tag {
 typedef struct GLWASM_Name {
   char * bytes;
   uint32_t length;
+  char * debug_bytes;
+  uint32_t debug_length;
 } GLWASM_Name;
+
+typedef struct GLWASM_NameEntry {
+  uint32_t index;
+  GLWASM_Name name;
+} GLWASM_NameEntry;
+
+typedef struct GLWASM_LocalNameMap {
+  GLWASM_NameEntry * entries;
+  uint32_t count;
+  uint32_t capacity;
+  uint32_t * index_slots; /**< Open-addressed index+1 lookup table. */
+  uint32_t index_capacity;
+} GLWASM_LocalNameMap;
 
 enum {
   GLWASM_EXT_FUNC = 0,
@@ -230,9 +252,15 @@ typedef struct GLWASM_Data {
 
 struct GLWASM_Module {
   GLWASM_Allocator alloc;
+  uint64_t reference_count;
+  uint32_t debug_id;
   GLWASM_Limits limits;
   GLWASM_Policy policy;
   uint8_t has_policy;
+  /* Immutable code is shared by every instance of this module. The page
+   * provider owns an independent runtime-core group and each cache retains it. */
+  GRCORE_CodePages * jit_pages;
+  GLWASM_JitCache * jit_cache;
   GLWASM_TypeDef * types;
   uint32_t ntypes;
   GLWASM_Import * imports;
@@ -248,6 +276,13 @@ struct GLWASM_Module {
   uint32_t nglobals;
   GLWASM_Export * exports;
   uint32_t nexports;
+  GLWASM_Name module_name;
+  GLWASM_Name * function_names;
+  uint32_t function_names_count;
+  uint32_t function_names_capacity;
+  GLWASM_LocalNameMap * local_names;
+  uint32_t local_names_count;
+  uint32_t local_names_capacity;
   int has_start;
   uint32_t start;
   GLWASM_Elem * elems;
@@ -259,6 +294,13 @@ struct GLWASM_Module {
   GLWASM_Tag * tags;
   uint32_t ntags;
 };
+
+/* The public destroy call releases the decoder's ownership reference. Runtime
+ * instances retain their own reference and use the same final-release path. */
+static inline void glwasm_module_retain(GLWASM_Module *module) {
+  if (module) __atomic_add_fetch(&module->reference_count, 1,
+      __ATOMIC_RELAXED);
+}
 
 typedef struct GLWASM_TranslatedInstr {
   GLWASM_Instr source;

@@ -152,7 +152,7 @@ export PATH := $(BIN_INSTALL_PATH):$(PATH)
 endif
 endif
 
-BUILD_DIR := ./build/$(BUILD)
+BUILD_DIR := $(if $(GLWASM_REAL_CORPUS_BUILD_DIR),$(abspath $(GLWASM_REAL_CORPUS_BUILD_DIR))/lang-wasm-build/$(BUILD),./build/$(BUILD))
 OBJ_DIR := $(BUILD_DIR)/objects
 FLAGS_STAMP := $(OBJ_DIR)/.flags
 GEN_DIR := $(BUILD_DIR)/generated
@@ -169,8 +169,14 @@ ifeq ($(filter-out $(DEPLESS_GOALS),$(or $(MAKECMDGOALS),all)),)
 SKIP_DEP_CHECK := 1
 endif
 
-CUTIL_PC ?= ghoti.io-cutil$(BRANCH)
-RCORE_PC ?= ghoti.io-runtime-core$(BRANCH)
+# Dependencies remain on their current major while this library's branch may
+# advance independently. Preserve the debug suffix and allow explicit overrides.
+DEPENDENCY_RELEASE_BRANCH := $(patsubst %-debug,%,$(BRANCH))
+DEPENDENCY_BUILD_SUFFIX := $(if $(filter %-debug,$(BRANCH)),-debug,)
+CUTIL_BRANCH ?= $(if $(filter -dev,$(DEPENDENCY_RELEASE_BRANCH)),-dev,-0)$(DEPENDENCY_BUILD_SUFFIX)
+RCORE_BRANCH ?= $(if $(filter -dev,$(DEPENDENCY_RELEASE_BRANCH)),-dev,-0)$(DEPENDENCY_BUILD_SUFFIX)
+CUTIL_PC ?= ghoti.io-cutil$(CUTIL_BRANCH)
+RCORE_PC ?= ghoti.io-runtime-core$(RCORE_BRANCH)
 CUTIL_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(CUTIL_PC) 2>/dev/null)
 CUTIL_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(CUTIL_PC) 2>/dev/null)
 CUTIL_LIBDIR := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs-only-L $(CUTIL_PC) 2>/dev/null | awk '{print $$1}' | sed 's/^-L//')
@@ -195,26 +201,67 @@ SOURCES := $(shell find src -type f -name '*.c')
 LIBOBJECTS := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cflags gtest`
-RJIT_PC ?= ghoti.io-runtime-jit$(BRANCH)
+RJIT_BRANCH ?= $(if $(filter -dev,$(DEPENDENCY_RELEASE_BRANCH)),-dev,-0)$(DEPENDENCY_BUILD_SUFFIX)
+RJIT_PC ?= ghoti.io-runtime-jit$(RJIT_BRANCH)
 RJIT_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(RJIT_PC) 2>/dev/null)
 RJIT_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(RJIT_PC) 2>/dev/null)
+RJIT_LIBDIR := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs-only-L $(RJIT_PC) 2>/dev/null | awk '{print $$1}' | sed 's/^-L//')
 RJIT_EXISTS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --exists $(RJIT_PC) 2>/dev/null && echo yes)
-NEED_RJIT_FIXTURE := $(filter test test-quiet test-valgrind test-asan testBoundary_wasm $(APP_DIR)/testBoundary_wasm$(EXE_EXTENSION),$(MAKECMDGOALS))
+ifeq ($(RJIT_EXISTS),yes)
+INCLUDE += $(RJIT_CFLAGS)
+else
+ifndef SKIP_DEP_CHECK
+$(error ghoti.io-runtime-jit was not found by pkg-config. Story 10 requires it for module-shared compiled code.)
+endif
+endif
+NEED_RJIT_FIXTURE := $(filter test test-quiet test-valgrind test-asan test-tsan test-gc-torture testBoundary_wasm $(APP_DIR)/testBoundary_wasm$(EXE_EXTENSION),$(MAKECMDGOALS))
 ifneq ($(RJIT_EXISTS),yes)
 ifneq ($(NEED_RJIT_FIXTURE),)
 ifndef SKIP_DEP_CHECK
-$(error ghoti.io-runtime-jit was not found by pkg-config; the Story 12 compiled boundary fixture requires it)
+$(error ghoti.io-runtime-jit was not found by pkg-config; the module JIT and compiled boundary acceptance tests require it)
 endif
 endif
 endif
-TEST_INCLUDE := $(INCLUDE) $(RJIT_CFLAGS)
+RDBG_BRANCH ?= $(if $(filter -dev,$(DEPENDENCY_RELEASE_BRANCH)),-dev,-0)$(DEPENDENCY_BUILD_SUFFIX)
+RDBG_PC ?= ghoti.io-runtime-debug$(RDBG_BRANCH)
+RDBG_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(RDBG_PC) 2>/dev/null)
+RDBG_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(RDBG_PC) 2>/dev/null)
+RDBG_EXISTS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --exists $(RDBG_PC) 2>/dev/null && echo yes)
+NEED_RDBG_FIXTURE := $(filter test test-quiet test-valgrind test-asan test-tsan test-gc-torture,$(MAKECMDGOALS))
+ifneq ($(RDBG_EXISTS),yes)
+ifneq ($(NEED_RDBG_FIXTURE),)
+ifndef SKIP_DEP_CHECK
+$(error ghoti.io-runtime-debug was not found by pkg-config; the Story 7 debugger contract tests require it)
+endif
+endif
+endif
+RHEAP_BRANCH ?= $(if $(filter -dev,$(DEPENDENCY_RELEASE_BRANCH)),-dev,-0)$(DEPENDENCY_BUILD_SUFFIX)
+RHEAP_PC ?= ghoti.io-runtime-heap$(RHEAP_BRANCH)
+RHEAP_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(RHEAP_PC) 2>/dev/null)
+RHEAP_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(RHEAP_PC) 2>/dev/null)
+RHEAP_LIBDIR := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs-only-L $(RHEAP_PC) 2>/dev/null | awk '{print $$1}' | sed 's/^-L//')
+RHEAP_EXISTS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --exists $(RHEAP_PC) 2>/dev/null && echo yes)
+# GNU ld searches every -L directory in command-line order, even when the
+# matching -l appears later. Put the selected heap prefix first for relocation
+# fixtures so an earlier base-prefix -L cannot silently select the non-moving
+# runtime-heap with the same soname.
+RHEAP_RELOCATE_LDFLAGS := $(if $(RHEAP_LIBDIR),-L$(RHEAP_LIBDIR))
+NEED_RHEAP_BOUNDARY := $(filter test test-quiet test-valgrind test-asan test-tsan test-gc-torture testBoundary_wasm test-boundary-gc test-boundary-relocate test-debug-relocate,$(MAKECMDGOALS))
+ifneq ($(RHEAP_EXISTS),yes)
+ifneq ($(NEED_RHEAP_BOUNDARY),)
+ifndef SKIP_DEP_CHECK
+$(error ghoti.io-runtime-heap was not found by pkg-config; the Story 12 boundary acceptance fixture requires it)
+endif
+endif
+endif
+TEST_INCLUDE := $(INCLUDE) $(RJIT_CFLAGS) $(RDBG_CFLAGS) $(RHEAP_CFLAGS)
 
-TEST_GATES ?= check-symbols check-aliasing check-stamps check-fp-contract check-labels check-edges check-wast-corpus fuzz-replay
+TEST_GATES ?= check-symbols check-aliasing check-stamps check-fp-contract check-labels check-edges check-wast-corpus check-benchmark-summarizer check-benchmark-runner fuzz-replay
 
 VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible --track-origins=yes --error-exitcode=1 --suppressions=tests/valgrind.supp
 
-WASMLIBRARY := -Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-archive $(RCORE_LIBS) $(CUTIL_LIBS)
-TEST_WASMLIBRARY := $(WASMLIBRARY) $(RJIT_LIBS)
+WASMLIBRARY := -Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-archive $(RJIT_LIBS) $(RCORE_LIBS) $(CUTIL_LIBS)
+TEST_WASMLIBRARY := $(WASMLIBRARY) $(RDBG_LIBS) $(RHEAP_LIBS)
 
 ifeq ($(OS_NAME), Windows)
 TEST_LDFLAGS := -Wl,--wrap=__mingw_fprintf
@@ -230,7 +277,9 @@ TEST_EXECUTABLES := $(addprefix $(APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(TEST_
 SAMPLE_HOST := $(APP_DIR)/sample_host$(EXE_EXTENSION)
 SAMPLE_HOST_OBJECT := $(OBJ_DIR)/examples/sample_host.o
 
-TEST_LD_PATH := $(APP_DIR):$(RCORE_LIBDIR):$(CUTIL_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)
+RDBG_LIBDIR := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs-only-L $(RDBG_PC) 2>/dev/null | awk '{print $$1}' | sed 's/^-L//')
+TEST_LD_PATH := $(APP_DIR):$(RJIT_LIBDIR):$(RCORE_LIBDIR):$(CUTIL_LIBDIR):$(RDBG_LIBDIR):$(RHEAP_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)
+RHEAP_RELOCATE_LD_PATH := $(if $(RHEAP_LIBDIR),$(RHEAP_LIBDIR):)$(TEST_LD_PATH)
 
 all: $(APP_DIR)/$(TARGET) $(APP_DIR)/$(STATIC_TARGET) ## Build shared + static libraries
 
@@ -275,7 +324,7 @@ $(OBJ_DIR)/%.o: src/%.c $(FLAGS_STAMP) | $(LIBVER_GEN)
 
 $(APP_DIR)/$(TARGET): $(LIBOBJECTS)
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -shared -o $@ $^ $(LDFLAGS) $(RCORE_LIBS) $(CUTIL_LIBS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)
+	$(CXX) $(CXXFLAGS) -shared -o $@ $^ $(LDFLAGS) $(RJIT_LIBS) $(RCORE_LIBS) $(CUTIL_LIBS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)
 ifeq ($(OS_NAME), Linux)
 	@ln -f -s $(TARGET) $(APP_DIR)/$(SO_NAME)
 	@ln -f -s $(SO_NAME) $(APP_DIR)/$(BASE_NAME)
@@ -311,11 +360,48 @@ endef
 $(foreach pair,$(TEST_PAIRS),\
 	$(eval $(call test-executable-rule,$(word 1,$(subst |, ,$(pair))),$(word 2,$(subst |, ,$(pair))))))
 
-.PHONY: clean cloc docs docs-pdf coverage check-symbols check-stamps check-fp-contract check-aliasing check-labels check-edges check-wast-corpus
+BOUNDARY_RELOCATE_OBJECT := $(OBJ_DIR)/tests/test_boundary_wasm_relocate.o
+BOUNDARY_RELOCATE_APP := $(APP_DIR)/testBoundary_wasm_relocate$(EXE_EXTENSION)
+$(BOUNDARY_RELOCATE_OBJECT): tests/unit/test_boundary_wasm.cpp $(FLAGS_STAMP) | $(LIBVER_GEN)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -DGLWASM_BOUNDARY_RELOCATE -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+$(BOUNDARY_RELOCATE_APP): $(BOUNDARY_RELOCATE_OBJECT) $(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(RHEAP_RELOCATE_LDFLAGS) $(LDFLAGS) $(TEST_LDFLAGS) $(TEST_WASMLIBRARY) $(TESTFLAGS)
+.PHONY: test-boundary-gc test-boundary-relocate
+test-boundary-gc: $(APP_DIR)/testBoundary_wasm$(EXE_EXTENSION) ## Run Story 12 boundary tests with runtime-heap GC torture
+	LD_LIBRARY_PATH="$(TEST_LD_PATH):$(RHEAP_LIBDIR)" tools/run-gtest-full.sh $<
+test-boundary-relocate: $(BOUNDARY_RELOCATE_APP) ## Require runtime-heap relocation mode for the Story 12 boundary tests
+	LD_LIBRARY_PATH="$(RHEAP_RELOCATE_LD_PATH)" tools/run-gtest-full.sh $<
+
+DEBUG_RELOCATE_OBJECT := $(OBJ_DIR)/tests/test_debug_relocate.o
+DEBUG_RELOCATE_APP := $(APP_DIR)/testDebug_relocate$(EXE_EXTENSION)
+.PHONY: check-debug-relocate-header test-debug-relocate
+check-debug-relocate-header:
+	@test -f "$(patsubst -I%,%,$(firstword $(RHEAP_CFLAGS)))/ghoti.io/runtime-heap/relocate.h" || { \
+		printf 'test-debug-relocate requires a RELOCATE=yes runtime-heap install on PKG_CONFIG_PATH\n' >&2; \
+		exit 1; \
+	}
+$(DEBUG_RELOCATE_OBJECT): tests/unit/test_debug.cpp $(FLAGS_STAMP) | check-debug-relocate-header $(LIBVER_GEN)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -DGLWASM_DEBUG_RELOCATE -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+$(DEBUG_RELOCATE_APP): $(DEBUG_RELOCATE_OBJECT) $(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(RHEAP_RELOCATE_LDFLAGS) $(LDFLAGS) $(TEST_LDFLAGS) $(TEST_WASMLIBRARY) $(TESTFLAGS)
+test-debug-relocate: $(DEBUG_RELOCATE_APP) ## Compare compiled debugger frames under GC torture, stack movement and relocation
+	@output=$$(env -u GTEST_FILTER -u GTEST_TOTAL_SHARDS -u GTEST_SHARD_INDEX \
+		-u GTEST_SHARD_STATUS_FILE -u GTEST_REPEAT -u GTEST_ALSO_RUN_DISABLED_TESTS \
+		LD_LIBRARY_PATH="$(RHEAP_RELOCATE_LD_PATH)" $< \
+		--gtest_filter='WasmDebug.CompiledFramesMatchInterpreterAtInstructionPolls:WasmDebug.NestedCompiledFrameIdentitiesMatchAtEveryInstructionPoll' \
+		--gtest_brief=0 --gtest_color=no 2>&1); \
+		rc=$$?; printf '%s\n' "$$output"; \
+		[ $$rc -eq 0 ] && [ "$$(printf '%s\n' "$$output" | grep -c '^\[ RUN      \] WasmDebug\.')" -eq 2 ] && \
+		[ "$$(printf '%s\n' "$$output" | grep -c '^\[==========\] 2 tests from .* ran\.')" -eq 1 ] && \
+		printf '%s\n' "$$output" | grep -q '^\[  PASSED  \] 2 tests\.' || exit 1
+
+.PHONY: clean cloc docs docs-pdf coverage check-symbols check-stamps check-fp-contract check-aliasing check-labels check-edges check-wast-corpus check-install test-tsan test-gc-torture
 .PHONY: all install test test-quiet test-asan test-valgrind uninstall
 .PHONY: fuzz fuzz-clean fuzz-replay help
-
-TEST_LD_PATH := $(APP_DIR):$(RCORE_LIBDIR):$(CUTIL_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)
 
 check-aliasing: ## Fail if -Wstrict-aliasing is not armed at level 1
 	@mkdir -p $(BUILD_DIR)
@@ -354,11 +440,14 @@ check-fp-contract: ## Fail if any guest-float compile flags permit contraction
 
 check-symbols: $(APP_DIR)/$(TARGET) ## Fail if any exported symbol lacks the version namespace
 	@tools/check-symbols.sh $(APP_DIR)/$(TARGET) $(LIBVER_SYMBOL) .
+ifeq ($(OS_NAME), Windows)
+	@tools/check-symbols-pe-controls.sh $(LIBVER_SYMBOL) .
+endif
 
 check-labels: ## Fail if a public header has no @stability free label
 	@tools/check-labels.sh .
 
-check-edges: $(APP_DIR)/$(TARGET) ## Fail on a dependency other than cutil
+check-edges: $(APP_DIR)/$(TARGET) ## Fail on a dependency outside cutil, runtime-core, and runtime-jit
 	@tools/check-edges.sh --includes .
 	@tools/check-edges.sh --links $(APP_DIR)
 
@@ -369,23 +458,43 @@ check-wast-corpus: ## Fail on corpus drift or an incomplete file classification
 		--classification tests/data-wast-classification.tsv \
 		--assertion-skips tests/data-wast-assertion-skips.tsv
 
-test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES) ## Build and run the tests
+.PHONY: check-benchmark-summarizer
+check-benchmark-summarizer: ## Validate Story 13 raw-sample completeness and pairing rules
+	@python3 tests/unit/test_benchmark_summarize.py
+
+.PHONY: check-gtest-full
+check-gtest-full: ## Prove full-suite selection and zero-test rejection
+	@tools/run-gtest-full.sh --selftest
+
+test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES) check-gtest-full ## Build and run the tests
 	@for test_exe in $(TEST_EXECUTABLES); do \
 		test_name=$$(basename $$test_exe $(EXE_EXTENSION)); \
 		printf '\n### Running %s ###\n\n' "$$test_name"; \
-		LD_LIBRARY_PATH="$(TEST_LD_PATH)" $$test_exe --gtest_brief=1 || exit 1; \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" tools/run-gtest-full.sh $$test_exe || exit 1; \
 	done
 
 test-quiet: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) ## Run tests, one line per suite
 	@for test_exe in $(TEST_EXECUTABLES); do \
-		LD_LIBRARY_PATH="$(TEST_LD_PATH)" $$test_exe --gtest_brief=1 || exit 1; \
+		output=$$(LD_LIBRARY_PATH="$(TEST_LD_PATH)" tools/run-gtest-full.sh $$test_exe 2>&1); \
+		rc=$$?; \
+		if [ $$rc -ne 0 ]; then printf '%s\n' "$$output"; exit $$rc; fi; \
+		summary=$$(printf '%s\n' "$$output" | grep '^run-gtest-full: completed ' | tail -1); \
+		if [ -z "$$summary" ]; then printf '%s\n' "$$output"; exit 2; fi; \
+		printf '%s: %s\n' "$$(basename $$test_exe $(EXE_EXTENSION))" "$$summary"; \
+	done
+
+test-gc-torture: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES) ## Run the full suite with runtime-heap torture enabled
+	@for test_exe in $(TEST_EXECUTABLES); do \
+		printf '\n### GC torture %s ###\n\n' "$$(basename $$test_exe)"; \
+		GRHEAP_TORTURE=1 LD_LIBRARY_PATH="$(TEST_LD_PATH)" \
+			tools/run-gtest-full.sh $$test_exe || exit 1; \
 	done
 
 test-valgrind: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) ## Run the tests under Valgrind
 ifeq ($(OS_NAME), Linux)
 	@for test_exe in $(TEST_EXECUTABLES); do \
 		printf '\n### Valgrind %s ###\n\n' "$$(basename $$test_exe)"; \
-		LD_LIBRARY_PATH="$(TEST_LD_PATH)" valgrind $(VALGRIND_FLAGS) $$test_exe --gtest_brief=1 || exit 1; \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" tools/run-gtest-full.sh valgrind $(VALGRIND_FLAGS) $$test_exe || exit 1; \
 	done
 else
 	@printf 'Valgrind is only available on Linux\n' >&2; exit 1
@@ -407,7 +516,7 @@ ASAN_DEPFILES := $(ASAN_LIBOBJECTS:.o=.d) \
     $(foreach pair,$(TEST_PAIRS),$(ASAN_OBJ_DIR)/tests/$(basename $(notdir $(word 1,$(subst |, ,$(pair))))).d)
 -include $(ASAN_DEPFILES)
 ASAN_ARCHIVE := $(ASAN_APP_DIR)/$(STATIC_TARGET)
-ASAN_WASMLIBRARY := -Wl,--whole-archive $(ASAN_ARCHIVE) -Wl,--no-whole-archive $(RCORE_LIBS) $(CUTIL_LIBS)
+ASAN_WASMLIBRARY := -Wl,--whole-archive $(ASAN_ARCHIVE) -Wl,--no-whole-archive $(RCORE_LIBS) $(CUTIL_LIBS) $(RHEAP_LIBS)
 ASAN_CFLAGS := $(CFLAGS) $(ASAN_UBSAN_FLAGS) -DGLWASM_BUILD
 ASAN_CXXFLAGS := $(CXXFLAGS) $(ASAN_UBSAN_FLAGS)
 ASAN_LDFLAGS := $(LDFLAGS) $(ASAN_UBSAN_FLAGS)
@@ -433,23 +542,90 @@ ASAN_TEST_OBJ_$1 := $(ASAN_OBJ_DIR)/tests/$(basename $(notdir $1)).o
 
 $(ASAN_APP_DIR)/$2$(EXE_EXTENSION): $$(ASAN_TEST_OBJ_$1) $(ASAN_ARCHIVE)
 	@mkdir -p $$(@D)
-	$(CXX) $(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $(ASAN_LDFLAGS) $(ASAN_WASMLIBRARY) $(RJIT_LIBS) $(TESTFLAGS)
+	$(CXX) $(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $(ASAN_LDFLAGS) $(ASAN_WASMLIBRARY) $(RJIT_LIBS) $(RDBG_LIBS) $(TESTFLAGS)
 endef
 
 $(foreach pair,$(TEST_PAIRS),\
 	$(eval $(call asan-test-executable-rule,$(word 1,$(subst |, ,$(pair))),$(word 2,$(subst |, ,$(pair))))))
 
 ASAN_TEST_EXECUTABLES := $(addprefix $(ASAN_APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(TEST_NAMES)))
-ASAN_RUNTIME := $(shell $(CC) -print-file-name=libasan.so 2>/dev/null)
+ASAN_RUNTIME := $(shell $(CXX) -print-file-name=libasan.so 2>/dev/null)
+ifneq ($(findstring clang,$(shell $(CXX) --version 2>/dev/null)),)
+ASAN_PRELOAD = GTEST_FULL_TEST_LD_PRELOAD= LD_PRELOAD=
+else
+ASAN_PRELOAD = GTEST_FULL_TEST_LD_PRELOAD="$(ASAN_RUNTIME)$${LD_PRELOAD:+:$$LD_PRELOAD}" LD_PRELOAD=
+endif
 
 test-asan: $(ASAN_TEST_EXECUTABLES) ## Build with ASan+UBSan and run the tests
 	@for test_exe in $(ASAN_TEST_EXECUTABLES); do \
 		printf '\n### ASan+UBSan %s ###\n\n' "$$(basename $$test_exe)"; \
-		LD_PRELOAD="$(ASAN_RUNTIME)$${LD_PRELOAD:+:$$LD_PRELOAD}" \
+		$(ASAN_PRELOAD) \
 		LD_LIBRARY_PATH="$(ASAN_APP_DIR):$(CUTIL_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)" \
-			$$test_exe --gtest_brief=1 || exit 1; \
+			tools/run-gtest-full.sh $$test_exe || exit 1; \
 	done
 	@printf '\nASan+UBSan suite clean.\n'
+
+####################################################################
+# ThreadSanitizer, in its own tree
+####################################################################
+
+TSAN_FLAGS := -fsanitize=thread -fno-omit-frame-pointer -g -O1
+TSAN_BUILD_DIR := ./build/$(BUILD)-tsan
+TSAN_OBJ_DIR := $(TSAN_BUILD_DIR)/objects
+TSAN_FLAGS_STAMP := $(TSAN_OBJ_DIR)/.flags
+TSAN_APP_DIR := $(TSAN_BUILD_DIR)/apps
+TSAN_LIBOBJECTS := $(patsubst src/%.c,$(TSAN_OBJ_DIR)/%.o,$(SOURCES))
+TSAN_DEPFILES := $(TSAN_LIBOBJECTS:.o=.d) \
+    $(foreach pair,$(TEST_PAIRS),$(TSAN_OBJ_DIR)/tests/$(basename $(notdir $(word 1,$(subst |, ,$(pair))))).d)
+-include $(TSAN_DEPFILES)
+TSAN_ARCHIVE := $(TSAN_APP_DIR)/$(STATIC_TARGET)
+TSAN_WASMLIBRARY := -Wl,--whole-archive $(TSAN_ARCHIVE) -Wl,--no-whole-archive \
+	$(RJIT_LIBS) $(RDBG_LIBS) $(RHEAP_LIBS) $(RCORE_LIBS) $(CUTIL_LIBS)
+TSAN_CFLAGS := $(CFLAGS) $(TSAN_FLAGS) -DGLWASM_BUILD
+TSAN_CXXFLAGS := $(CXXFLAGS) $(TSAN_FLAGS)
+TSAN_LDFLAGS := $(LDFLAGS) $(TSAN_FLAGS)
+ifeq ($(UNAME_S), Linux)
+	TSAN_CFLAGS += -fPIC
+endif
+
+$(TSAN_OBJ_DIR)/%.o: src/%.c $(TSAN_FLAGS_STAMP) | $(LIBVER_GEN)
+	@mkdir -p $(@D)
+	$(CC) $(TSAN_CFLAGS) $(INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
+$(TSAN_ARCHIVE): $(TSAN_LIBOBJECTS)
+	@mkdir -p $(@D)
+	@rm -f $@
+	ar rcs $@ $^
+
+$(TSAN_OBJ_DIR)/tests/%.o: tests/unit/%.cpp $(TSAN_FLAGS_STAMP) | $(LIBVER_GEN)
+	@mkdir -p $(@D)
+	$(CXX) $(TSAN_CXXFLAGS) $(TEST_INCLUDE) -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+
+define tsan-test-executable-rule
+TSAN_TEST_OBJ_$1 := $(TSAN_OBJ_DIR)/tests/$(basename $(notdir $1)).o
+
+$(TSAN_APP_DIR)/$2$(EXE_EXTENSION): $$(TSAN_TEST_OBJ_$1) $(TSAN_ARCHIVE)
+	@mkdir -p $$(@D)
+	$(CXX) $(TSAN_CXXFLAGS) -o $$@ $$(TSAN_TEST_OBJ_$1) $(TSAN_LDFLAGS) $(TEST_LDFLAGS) $(TSAN_WASMLIBRARY) $(TESTFLAGS)
+endef
+
+$(foreach pair,$(TEST_PAIRS),\
+	$(eval $(call tsan-test-executable-rule,$(word 1,$(subst |, ,$(pair))),$(word 2,$(subst |, ,$(pair))))))
+
+TSAN_TEST_EXECUTABLES := $(addprefix $(TSAN_APP_DIR)/,$(addsuffix $(EXE_EXTENSION),$(TEST_NAMES)))
+TSAN_RUN_ENV := LD_PRELOAD= LD_LIBRARY_PATH="$(TSAN_APP_DIR):$(RJIT_LIBDIR):$(RCORE_LIBDIR):$(CUTIL_LIBDIR):$(RDBG_LIBDIR):$(RHEAP_LIBDIR):$(LIB_INSTALL_PATH)/$(SUITE)" \
+	TSAN_OPTIONS="halt_on_error=1:history_size=7:second_deadlock_stack=1"
+
+test-tsan: $(TSAN_TEST_EXECUTABLES) ## Build with TSan and run the tests (Linux only)
+ifeq ($(OS_NAME), Linux)
+	@for test_exe in $(TSAN_TEST_EXECUTABLES); do \
+		printf '\n### TSan %s ###\n\n' "$$(basename $$test_exe)"; \
+		$(TSAN_RUN_ENV) tools/run-gtest-full.sh $$test_exe || exit 1; \
+	done
+	@printf '\nTSan suite clean.\n'
+else
+	@printf 'ThreadSanitizer builds are only supported on Linux\n' >&2; exit 1
+endif
 
 ####################################################################
 # Fuzzing
@@ -483,7 +659,7 @@ $$(FUZZ_APP_DIR)/fuzz_$2: tests/fuzz/fuzz_$2.c $$(FUZZ_OBJECTS) $$(FUZZ_FLAGS_ST
 	fi
 	@mkdir -p $$(@D) $$(FUZZ_CORPUS)/$2
 	$$(FUZZ_CC) $$(FUZZ_BIN_FLAGS) -std=c17 $(INCLUDE) \
-		-o $$@ $$< $$(FUZZ_OBJECTS) $(RCORE_LIBS) $(CUTIL_LIBS) -lm
+		-o $$@ $$< $$(FUZZ_OBJECTS) $(RJIT_LIBS) $(RCORE_LIBS) $(CUTIL_LIBS) -lm
 
 fuzz-run-$2: $$(FUZZ_APP_DIR)/fuzz_$2 ## Run the $2 fuzzer for $$(FUZZ_TIME) seconds
 	@mkdir -p $$(FUZZ_CORPUS)/$2
@@ -501,19 +677,19 @@ ifeq ($(strip $(FUZZERS)),)
 	@printf 'fuzz: no fuzzers in tests/fuzz\n' >&2; exit 1
 endif
 
-$(APP_DIR)/fuzz/replay_%: tests/fuzz/fuzz_%.c tests/fuzz/replay_main.c \
+$(APP_DIR)/fuzz/replay_%$(EXE_EXTENSION): tests/fuzz/fuzz_%.c tests/fuzz/replay_main.c \
 		$(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(LIBVER_GEN)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ tests/fuzz/fuzz_$*.c tests/fuzz/replay_main.c $(LDFLAGS) $(WASMLIBRARY) -lm
 
-fuzz-replay: $(APP_DIR)/fuzz/replay_decode $(APP_DIR)/fuzz/replay_validate ## Replay the seed corpus
+fuzz-replay: $(APP_DIR)/fuzz/replay_decode$(EXE_EXTENSION) $(APP_DIR)/fuzz/replay_validate$(EXE_EXTENSION) ## Replay the seed corpus
 	@files=$$(find tests/fuzz/corpus -type f | sort); \
 	if [ -z "$$files" ]; then \
 		printf 'fuzz-replay: no corpus files\n' >&2; \
 		exit 1; \
 	fi; \
-	LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(APP_DIR)/fuzz/replay_decode $$files; \
-	LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(APP_DIR)/fuzz/replay_validate $$files
+	LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(APP_DIR)/fuzz/replay_decode$(EXE_EXTENSION) $$files || exit $$?; \
+	LD_LIBRARY_PATH="$(TEST_LD_PATH)" $(APP_DIR)/fuzz/replay_validate$(EXE_EXTENSION) $$files
 
 fuzz-clean: ## Remove the fuzz build
 	-@rm -rf $(FUZZ_DIR)
@@ -523,8 +699,13 @@ fuzz-clean: ## Remove the fuzz build
 ####################################################################
 
 LDCONF_INSTALL_PATH ?= /etc/ld.so.conf.d
-PC_REQUIRES := $(CUTIL_PC), $(RCORE_PC)
+PC_REQUIRES := $(CUTIL_PC) $(RCORE_PC) $(RJIT_PC)
 PKGCONFIG_INSTALL_PATH ?= $(PC_INSTALL_PATH)
+
+CHECK_INSTALL_PREFIX ?= $(if $(PREFIX),$(PREFIX),/usr/local)
+CHECK_INSTALL_MODULE ?= ghoti.io-lang-wasm$(BRANCH)
+check-install: ## Verify an installed consumer using pkg-config and the public umbrella header
+	@tools/check-install.sh "$(CHECK_INSTALL_PREFIX)" "$(CHECK_INSTALL_MODULE)"
 
 install: all ## Install the library
 	@mkdir -p $(LIB_INSTALL_PATH)/$(SUITE)
@@ -592,6 +773,63 @@ coverage: ## Build instrumented, run the tests, and report line coverage
 clean: ## Remove the build directories
 	-@rm -rf ./build
 
+####################################################################
+# Optional Story 11 real-program corpus gate. Source and toolchain fetches are
+# explicit so `make test` remains hermetic and does not require network access.
+####################################################################
+
+REAL_CORPUS_OBJECT := $(OBJ_DIR)/tests/real_corpus_test.o
+REAL_CORPUS_APP := $(APP_DIR)/test_real_corpus$(EXE_EXTENSION)
+REAL_CORPUS_RELOCATE_OBJECT := $(OBJ_DIR)/tests/real_corpus_relocate_test.o
+REAL_CORPUS_RELOCATE_APP := $(APP_DIR)/test_real_corpus_relocate$(EXE_EXTENSION)
+-include $(REAL_CORPUS_OBJECT:.o=.d) $(REAL_CORPUS_RELOCATE_OBJECT:.o=.d)
+REAL_CORPUS_BUILD_DIR ?= $(if $(GLWASM_REAL_CORPUS_BUILD_DIR),$(GLWASM_REAL_CORPUS_BUILD_DIR),$(abspath build/real-corpus))
+NEED_REAL_CORPUS_HEAP := $(filter test-real-corpus test-real-corpus-relocate,$(MAKECMDGOALS))
+ifneq ($(strip $(NEED_REAL_CORPUS_HEAP)),)
+ifeq ($(strip $(RHEAP_LIBS)),)
+$(error ghoti.io-runtime-heap was not found by pkg-config; the real-corpus stress modes require it)
+endif
+endif
+
+$(REAL_CORPUS_OBJECT): tests/real-corpus/real_corpus_test.cpp $(FLAGS_STAMP) | $(LIBVER_GEN)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) $(RHEAP_CFLAGS) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
+
+$(REAL_CORPUS_APP): $(REAL_CORPUS_OBJECT) $(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS) $(TEST_LDFLAGS) $(TEST_WASMLIBRARY) $(RHEAP_LIBS) $(TESTFLAGS)
+
+.PHONY: check-real-corpus-relocate-header
+check-real-corpus-relocate-header:
+	@test -f "$(patsubst -I%,%,$(firstword $(RHEAP_CFLAGS)))/ghoti.io/runtime-heap/relocate.h" || { \
+		printf 'test-real-corpus-relocate requires a RELOCATE=yes runtime-heap install on PKG_CONFIG_PATH\n' >&2; \
+		exit 1; \
+	}
+
+$(REAL_CORPUS_RELOCATE_OBJECT): tests/real-corpus/real_corpus_test.cpp $(FLAGS_STAMP) | check-real-corpus-relocate-header $(LIBVER_GEN)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) $(RHEAP_CFLAGS) -DGLWASM_CORPUS_RELOCATE -MMD -MP -MF $(@:.o=.d) -c $< -o $@
+
+$(REAL_CORPUS_RELOCATE_APP): $(REAL_CORPUS_RELOCATE_OBJECT) $(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(RHEAP_RELOCATE_LDFLAGS) $(LDFLAGS) $(TEST_LDFLAGS) $(TEST_WASMLIBRARY) $(RHEAP_LIBS) $(TESTFLAGS)
+
+.PHONY: test-real-corpus
+test-real-corpus: $(REAL_CORPUS_APP) ## Verify pinned native, interpreter, JIT and Wasmtime real-program corpus
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH):$(RHEAP_LIBDIR)" python3 tests/real-corpus/test_selection_guard.py "$(REAL_CORPUS_APP)" 12
+	@GLWASM_REAL_CORPUS_BUILD_DIR="$(REAL_CORPUS_BUILD_DIR)" tools/real-corpus/build-and-run.sh --all-tiers
+	@GLWASM_REAL_CORPUS_DIR="$(abspath tests/real-corpus)" \
+	 GLWASM_REAL_CORPUS_MODULE_DIR="$(REAL_CORPUS_BUILD_DIR)/modules" \
+	 LD_LIBRARY_PATH="$(TEST_LD_PATH):$(RHEAP_LIBDIR)" $(REAL_CORPUS_APP) --gtest_brief=1
+
+.PHONY: test-real-corpus-relocate
+test-real-corpus-relocate: $(REAL_CORPUS_RELOCATE_APP) ## Require compiled runtime-heap relocation mode and run the full corpus in both tiers
+	@LD_LIBRARY_PATH="$(RHEAP_RELOCATE_LD_PATH)" python3 tests/real-corpus/test_selection_guard.py "$(REAL_CORPUS_RELOCATE_APP)" 18
+	@GLWASM_REAL_CORPUS_BUILD_DIR="$(REAL_CORPUS_BUILD_DIR)" tools/real-corpus/build-and-run.sh --all-tiers
+	@GLWASM_REAL_CORPUS_DIR="$(abspath tests/real-corpus)" \
+	 GLWASM_REAL_CORPUS_MODULE_DIR="$(REAL_CORPUS_BUILD_DIR)/modules" \
+	 LD_LIBRARY_PATH="$(RHEAP_RELOCATE_LD_PATH)" $(REAL_CORPUS_RELOCATE_APP) --gtest_brief=1
+
 help: ## Display this help
 	@grep -E '^[ a-zA-Z_-]+:.*?## .*$$' Makefile | sort | sed 's/\([^:]*\):.*## \(.*\)/\1:\2/' | awk -F: '{printf "%-22s %s\n", $$1, $$2}'
 
@@ -603,15 +841,22 @@ help: ## Display this help
 
 $(FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(CC) $(CXX) $(LIB_CFLAGS) $(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE) $(WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(CUTIL_CFLAGS) $(TEST_INCLUDE) $(RJIT_LIBS) $(TEST_WASMLIBRARY) $(TESTFLAGS) $(TEST_LDFLAGS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(LIB_CFLAGS) $(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE) $(WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(CUTIL_CFLAGS) $(TEST_INCLUDE) $(RJIT_LIBS) $(RDBG_LIBS) $(RHEAP_CFLAGS) $(RHEAP_LIBS) $(RHEAP_RELOCATE_LDFLAGS) $(TEST_WASMLIBRARY) $(BENCH_GSEC_CFLAGS) $(BENCH_GSEC_LIBS) $(TESTFLAGS) $(TEST_LDFLAGS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(ASAN_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(TEST_INCLUDE) $(ASAN_WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(RJIT_LIBS) $(TESTFLAGS)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(TEST_INCLUDE) $(ASAN_WASMLIBRARY) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(RJIT_LIBS) $(RDBG_LIBS) $(TESTFLAGS)' > $@.new
+	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
+
+$(TSAN_FLAGS_STAMP): force-flags
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(CC) $(CXX) $(TSAN_CFLAGS) $(TSAN_CXXFLAGS) $(TSAN_LDFLAGS) $(INCLUDE) $(TEST_INCLUDE) $(TSAN_WASMLIBRARY) $(RJIT_LIBS) $(RDBG_LIBS) $(RHEAP_LIBS) $(RCORE_LIBS) $(CUTIL_LIBS) $(TESTFLAGS) $(TEST_LDFLAGS)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(FUZZ_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(INCLUDE) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(FUZZ_SAN)' > $@.new
+	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(INCLUDE) $(RJIT_LIBS) $(RCORE_LIBS) $(RCORE_CFLAGS) $(CUTIL_LIBS) $(FUZZ_SAN)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
+
+include benchmarks/targets.mk

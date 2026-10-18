@@ -1,6 +1,6 @@
 # Ghoti.io Lang-wasm
 
-A WebAssembly 3.0 decoder, validator, translator and interpreter foundation
+A WebAssembly 3.0 decoder, validator, translator, interpreter and baseline JIT
 (`GLWASM`). Binary decoding and validation remain separate passes. It is part of the
 [Ghoti.io suite](https://github.com/Ghoti-io/suite).
 
@@ -9,7 +9,7 @@ The design, including the limit defaults and the type lattice, is in
 
 ## Status
 
-**Interpreter core in progress.** Decode and validation of the in-scope feature set are in
+**Interpreter and baseline JIT implemented for the in-scope feature set.** Decode and validation are in
 place: multiple memories, memory64, table64, exceptions, tail calls, bulk
 memory and extended constant expressions. The public `parse.h` API parses
 WAT/WAST parenthesized syntax into an owned tree, preserving source locations
@@ -39,32 +39,43 @@ frontend and does not yet cover the in-scope WAT grammar.
 Validated instructions retain absolute module byte offsets (for WAT, offsets
 refer to the canonical lowered binary). Translation creates module-owned
 instruction arrays with resolved structured branch destinations and a total,
-monotonic offset map including its terminal boundary. Executable coverage is
-provided by an internal runtime-core-backed interpreter used by the test
-adapter. Its current executable subset covers exception tags, `throw`,
-`throw_ref`, and `try_table`, including ordered handler dispatch, payload and
-exception-reference transfer, nested-call propagation, and terminal limit
-handling. Focused tests and 21 pinned exception assertions cover this subset;
-compiled execution remains assigned to Story 10. The remaining subset covers
-i32 `eqz`, `eq`, `ne`, signed and
-unsigned `lt`, `gt`, `le`, and `ge`; i32 `add`, `sub`, `mul`, signed/unsigned
-`div`, `and`, `or`, `xor`, and shifts; i64 `add`, `sub`, `mul`, `and`, `or`,
-and `xor`; and f32/f64 `add`, `sub`, `mul`, `div`, `min`, `max`, and
-`copysign`. It also covers locals/globals, structured control flow including
-`br_table`, direct calls, `call_indirect`, tail calls, module start functions,
-and these trap cases: `unreachable`, i32 division by zero or overflow, table
-bounds failures, uninitialized elements, and indirect-call type mismatches.
-Other MVP numeric operators and conversions,
-unsupported multi-result/value forms, and later-story instructions remain
-pending. Guest calls use persistent runtime-core frames rather than C
-recursion; traps carry Wasm trap kinds, and polls, fuel, guest-depth limits,
-pause/resume, and moving-stack behavior have focused tests. Fuel costs one
-unit per Wasm opcode using the cost table shared with the later JIT. Runtime
-table initialization supports active `ref.func` and `ref.null` elements;
-table growth, imported tables, and other table operations remain pending. This
-is not yet a public embedder or import API. Unsupported later-story instructions
-remain pending, never counted as passes. This library depends on `cutil` and
-`runtime-core` through pkg-config.
+monotonic offset map including its terminal boundary. The runtime-core-backed
+interpreter and baseline JIT cover the supported numeric, control-flow, call,
+memory, table, bulk-operation, reference, and exception paths exercised by the
+pinned WAST and real-program corpora. Unsupported instructions and signatures
+receive explicit refusals; the JIT's normal policy falls back before a guest
+effect, while its required-tier test mode reports the refusal. Guest calls use
+persistent runtime-core frames rather than C recursion; traps carry Wasm trap
+kinds, and polls, fuel, guest-depth limits, pause/resume, and moving-stack
+behavior have focused tests. Fuel costs one unit per Wasm opcode using a table
+shared by the interpreter and JIT. Runtime tables support imported and defined
+resources, initialization, growth, and bulk operations. The public embedder
+and import API provides exact import grants. Deferred features remain visible
+in the WAST classification and are never counted as passes. The library depends on
+`cutil`, `runtime-core`, and `runtime-jit` through pkg-config. The `runtime-jit`
+dependency supplies Story 10's module-shared compiled tier; `runtime-debug` is
+an optional test-only dependency for the debugger contract tests.
+
+## Debugging a paused context
+
+Story 7 exposes `glwasm_runtime_context` as a borrowed context for attaching
+`runtime-debug`. A Wasm frame reports its module name, full-width function
+identity and absolute byte offset; its source-line field is zero. Optional
+module/function/local names come from the bounded `name` custom section.
+Paused frames expose locals, operand-stack slots, imported and defined globals,
+and read-only, bounds-checked memory ranges. Instruction breakpoints match the
+exact `(engine, module, function, byte offset)` identity. Instruction stepping advances one
+poll; function stepping enters, steps over, or exits functions. Memory and
+frame views are available only while the context is readable and remain valid
+only for that stop. The compiled debugger path and cross-tier frame differential
+are implemented and exercised in ordinary, GC-torture, and relocation gates.
+
+The frame differential compares identity, locals, operand-stack slots, globals
+and read-only memory at each instruction poll. It runs with a torture heap and
+an always-moving runtime-core stack; `make test-debug-relocate` repeats that
+comparison with a live rooted probe and requires the relocation collector to
+move it and preserve its value. The relocation target requires a
+`RELOCATE=yes` runtime-heap installed in the first `PKG_CONFIG_PATH` prefix.
 
 The WAST gate pins its supported execution count and deferred standalone
 invocation count in `tests/data-wast-execution-baseline.tsv`, keyed to the
@@ -133,10 +144,19 @@ bits, or runtime budget defaults. `glwasm_module_decode_with_policy` applies
 the limits before decode allocations, rejects disabled in-scope features, and
 stores the selected policy with the module. The policy is immutable after
 decode. Instantiate with `glwasm_runtime_create_with_imports`; every imported
-function must have an exact module-and-field entry in its allowlist. The
-versioned `tang.v1` namespace is not granted implicitly. Destroy instances
-before their borrowed module, and resume a paused call with
+function must have an exact module-and-field entry in its allowlist. Imports
+under `tang.*` also require `allow_tang_v1_imports` in the decoded module
+policy; this capability is disabled by every preset and grants only the
+`tang.v1` version. Destroy instances before their borrowed module, and resume a paused call with
 `glwasm_runtime_resume`.
+
+The module policy's `jit_disabled_cpu_features` selects an immutable JIT cache
+key. Presets disable optional CPU features for portable baseline code. A
+caller may set this mask to `GRJIT_FEATURES_NONE` before decode to use features
+the host actually supports; unknown mask bits are rejected. Instances of one
+module share compiled artifacts. When two instances bind to the same
+runtime-core context, each keeps its own entry slot and registration ownership,
+so unbinding or destroying one leaves the other's compiled code available.
 
 The linker accepts exact module-and-field grants for functions, memories,
 tables, globals, and tags. Resource imports use typed provider callbacks; memory
@@ -157,8 +177,23 @@ in that context and open a runtime-core boundary activation for each call. The
 boundary stores foreign exception origin and identity tokens; the owner remains
 responsible for rooting and relocation. The test-only real-Wasm fixture covers
 reentry, pause/resume, instance isolation, and identity transport. Production
-Tang loader integration and cross-heap handle rooting remain owned by Tang
-Story 14 and runtime-core Story 13, respectively.
+Tang loader integration belongs to Story 14 of
+`spec-tang-host-extensibility`. Cross-heap handle rooting is owned by Story 13
+(CAP-14) of `spec-tang-host-extensibility`, with runtime-core providing the
+implementation.
+
+An uncaught Wasm exception crossing a nested boundary is returned as an
+opaque `GLWASM_ForeignException` engine/identity pair through
+`glwasm_runtime_last_foreign_exception`. Its identity is stable for the
+originating runtime's lifetime and can be passed back as an `exnref` to that
+runtime. The implementation never exposes the exception object's address;
+limits remain uncatchable and do not set the foreign-exception result.
+Exception records are allocated through the runtime-core context allocator and
+remain owned by the originating runtime until it is destroyed. This keeps
+`exnref` and foreign identity tokens valid across rethrows. Their allocations
+count against the context memory budget; exhausting it is a terminal,
+uncatchable `GLWASM_ERR_LIMIT`, including when a guest repeatedly throws and
+catches exceptions without retaining an `exnref`.
 
 The runnable sample host invokes `examples/runaway.wasm` under the untrusted
 policy and prints the pause location:
@@ -178,3 +213,53 @@ Pass `PREFIX` on every make. pkg-config is how the library finds `cutil` and
 `runtime-core`.
 Once installed, a program links with
 `pkg-config --cflags --libs ghoti.io-lang-wasm-0`.
+
+Verify the installed consumer path with:
+
+```bash
+make -C libs/lang-wasm check-install PREFIX="$PWD/.local"
+```
+
+This checks pkg-config metadata, installed include and library paths, and a C
+and C++ consumer that links and runs through the installed umbrella header.
+
+## Compiler, runtime, and measurement status
+
+The release acceptance compiler is GCC 16.2.0 in the pinned
+`ghoti-build:gcc16` image. Native results are required from EVO-X2 x86-64 and
+Raspberry Pi 4 arm64. The architecture matrix also includes the documented
+qemu arm64 and Wine Win64 gates, with baseline/no-optional-feature and
+supported-feature CPU masks where those gates apply. A compiler or runtime
+refusal must be recorded as a limitation; it is not a passing skip. Follow
+the [xarch guide](../../suite/tools/xarch/README.md) and
+[Wine guide](../../suite/tools/xwin/README.md) for the cross-platform gate
+environments.
+
+The explicit safety targets are `test`, `test-valgrind`, `test-asan`,
+`test-tsan`, `test-gc-torture`, `fuzz-replay`, `test-boundary-gc`,
+`test-boundary-relocate`, `test-debug-relocate`, `test-real-corpus`,
+`test-real-corpus-relocate`, and `check-install`. The optional measurement
+targets are `benchmark-fixture-hashes`, `benchmark-metadata`, and
+`benchmark`; they are not dependencies of the ordinary build or test targets.
+The benchmark requires runtime-debug development files and explicit provenance
+inputs. See [the benchmark protocol](benchmarks/README.md) for setup, exact
+commands, raw artifact requirements, workload definitions, and summaries.
+
+As of 2026-10-18, the five canonical Wasm module hashes match between X2 and
+Pi. Earlier native GCC 16 source snapshots passed the ordinary, GC-torture,
+installed-consumer, pinned WAST, and 12-case real-program corpus gates on both
+machines. The native X2 and Pi relocation corpus gates each passed all 18
+cases. The full Wine and qemu AArch64 cross gates passed and were fetched from
+earlier snapshots. A later audit hardened full-suite Google Test selection,
+so post-wrapper ordinary, ASan/UBSan, TSan, GC-torture, Valgrind, relocation,
+and cross gates remain open,
+as do final source-matched, quiet-host benchmark distributions.
+Early 30-sample paired measurements on X2 and Pi show compiled medians below
+interpreter medians for the loop, call, memory, and table/bulk fixtures; the
+hybrid mixed-boundary fixture is faster than its interpreter comparison.
+These samples have retained raw data and provenance, but the final source and
+quiet-host timing pass remains open. Interpret performance per workload.
+The mixed-boundary `hybrid` workload measures a
+compiled outer loop that calls an interpreted nested instance; it is not a
+whole-workload JIT comparison. First-call latency and debugger polling
+diagnostics are separate from steady-state timing.

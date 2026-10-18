@@ -8,6 +8,7 @@
 #define GHOTI_IO_GLWASM_POLICY_H
 #include <ghoti.io/lang-wasm/decode.h>
 #include <ghoti.io/lang-wasm/macros.h>
+#include <ghoti.io/runtime-jit/features.h>
 #include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
@@ -28,13 +29,28 @@ enum {
   GLWASM_FEATURE_REFERENCE_TYPES = UINT64_C(1) << 6,
   GLWASM_FEATURE_EXTENDED_CONST = UINT64_C(1) << 7
 };
+/** Immutable decode and runtime policy copied into a validated module.
+ * Start with ::glwasm_policy_preset, then adjust fields before decoding. */
 typedef struct GLWASM_Policy {
-  GLWASM_Limits limits;
-  uint64_t features;
-  uint64_t default_fuel;
-  uint64_t default_guest_depth;
-  uint64_t default_native_depth;
-  uint64_t default_memory_bytes;
+  GLWASM_Limits limits; /**< Structural and resource limits for decoding. */
+  uint64_t features; /**< Enabled GLWASM_FEATURE_* proposal bit mask. */
+  uint64_t default_fuel; /**< Initial instruction fuel for each instance. */
+  uint64_t default_guest_depth; /**< Maximum guest call depth. */
+  uint64_t default_native_depth; /**< Maximum nested native call depth. */
+  uint64_t default_memory_bytes; /**< Default runtime-core memory budget. */
+  /** Privileged Tang boundary imports require both this capability and an
+   * exact versioned host binding. Presets leave it disabled. */
+  uint8_t allow_tang_v1_imports;
+  /** Maximum aggregate executable mapping bytes cached by one decoded module.
+   * This is copied into the module before decode and is shared by all of its
+   * instances. Zero disables compilation. */
+  uint64_t max_jit_code_bytes;
+  /** Optional native CPU features excluded from this decoded module's JIT.
+   * Presets disable every optional feature for portable baseline code.
+   * Set to GRJIT_FEATURES_NONE to use features detected on this host.
+   * Unknown bits are invalid. The mask and compiled cache are immutable for
+   * the module's lifetime; it cannot enable a feature absent from the CPU. */
+  GRJIT_Features jit_disabled_cpu_features;
 } GLWASM_Policy;
 GLWASM_API GLWASM_Result glwasm_policy_preset(GLWASM_PolicyPreset preset,
     GLWASM_Policy *out_policy);

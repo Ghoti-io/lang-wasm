@@ -29,14 +29,18 @@
 #include <ghoti.io/lang-wasm/macros.h>
 
 #include <ghoti.io/cutil/allocator.h>
+#include <ghoti.io/cutil/safemath.h>
 #include <ghoti.io/lang-wasm/decode.h>
 
 #include "../module_internal.h"
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #define GLWASM_PAGE 65536ull
+
+static atomic_uint_fast64_t next_debug_module_id = 1;
 
 enum {
   GLWASM_KIND_FUNC = 1,
@@ -58,6 +62,8 @@ typedef struct Reader {
   const GLWASM_Allocator * alloc;
   GLWASM_Module * mod;
 } Reader;
+
+static int prepare_debug_name(Reader * r, GLWASM_Name * name);
 
 static int fail(Reader * r, GLWASM_Result err) {
   r->err = err;
@@ -103,6 +109,14 @@ static void * alloc_array(Reader * r, uint32_t count, size_t elem,
     }
     return p;
   }
+}
+
+/* Keep the element size as a runtime parameter to avoid type-range warnings
+ * on 64-bit targets while retaining the overflow check for 32-bit targets. */
+static int array_size(uint32_t count, size_t elem, size_t * out) {
+  if (elem != 0 && (size_t)count > SIZE_MAX / elem) return 0;
+  *out = (size_t)count * elem;
+  return 1;
 }
 
 static void mod_free(GLWASM_Module * m, void * p) {
@@ -556,7 +570,15 @@ static int check_memory(Reader * r, const LimInfo * lim) {
   if (min_bytes > r->limits->memory_initial) {
     return fail_limit(r, "memory_initial");
   }
-  eff = lim->has_max ? lim->max : spec;
+  if (min_bytes > r->limits->memory_maximum) {
+    return fail_limit(r, "memory_maximum");
+  }
+  /* An omitted maximum leaves the Wasm-declared limit unconstrained (up to
+   * the core-spec address limit). The host's memory_maximum is enforced on
+   * actual allocation and growth; treating it as a declared maximum here
+   * would reject otherwise valid modules before they execute. */
+  if (!lim->has_max) return 1;
+  eff = lim->max;
   if (eff > UINT64_MAX / GLWASM_PAGE) {
     /* A 64-bit unbounded memory has a theoretical maximum of 2^64 bytes,
      * one page beyond uint64_t. UINT64_MAX is the largest host cap; treat it
@@ -1245,9 +1267,12 @@ static void free_func(GLWASM_Module * m, GLWASM_Func * fn) {
 }
 
 static void free_name(GLWASM_Module * m, GLWASM_Name * name) {
+  mod_free(m, name->debug_bytes);
   mod_free(m, name->bytes);
   name->bytes = NULL;
   name->length = 0;
+  name->debug_bytes = NULL;
+  name->debug_length = 0;
 }
 
 static void free_type(GLWASM_Module * m, GLWASM_TypeDef * td) {
@@ -1258,12 +1283,13 @@ static void free_type(GLWASM_Module * m, GLWASM_TypeDef * td) {
   memset(td, 0, sizeof(*td));
 }
 
-void glwasm_module_destroy(GLWASM_Module * module) {
+static void glwasm_module_free(GLWASM_Module * module) {
   uint32_t i;
 
   if (!module) {
     return;
   }
+  GHOTIIO_LANG_WASM(glwasm_jit_module_destroy)(module);
   for (i = 0; i < module->ntypes; i++) {
     free_type(module, &module->types[i]);
   }
@@ -1292,6 +1318,19 @@ void glwasm_module_destroy(GLWASM_Module * module) {
     free_name(module, &module->exports[i].name);
   }
   mod_free(module, module->exports);
+  free_name(module, &module->module_name);
+  for (i = 0; i < module->function_names_count; i++) {
+    free_name(module, &module->function_names[i]);
+  }
+  mod_free(module, module->function_names);
+  for (i = 0; i < module->local_names_count; i++) {
+    for (uint32_t j = 0; j < module->local_names[i].count; j++) {
+      free_name(module, &module->local_names[i].entries[j].name);
+    }
+    mod_free(module, module->local_names[i].entries);
+    mod_free(module, module->local_names[i].index_slots);
+  }
+  mod_free(module, module->local_names);
   for (i = 0; i < module->nelems; i++) {
     uint32_t e;
 
@@ -1310,6 +1349,13 @@ void glwasm_module_destroy(GLWASM_Module * module) {
   mod_free(module, module->datas);
   mod_free(module, module->tags);
   gcu_allocator_free(&module->alloc, module);
+}
+
+void glwasm_module_destroy(GLWASM_Module * module) {
+  if (!module) return;
+  if (__atomic_sub_fetch(&module->reference_count, 1,
+      __ATOMIC_ACQ_REL) == 0)
+    glwasm_module_free(module);
 }
 
 static int reserve(Reader * r, void * old, void * * out, uint32_t * n,
@@ -1768,8 +1814,8 @@ static int parse_exports(Reader * r) {
     GLWASM_Export * ex = &r->mod->exports[i];
     uint8_t kind;
 
-    if (!read_name(r, &ex->name) || !read_byte(r, &kind) ||
-        !read_u32(r, &ex->index)) {
+    if (!read_name(r, &ex->name) || !prepare_debug_name(r, &ex->name) ||
+        !read_byte(r, &kind) || !read_u32(r, &ex->index)) {
       return 0;
     }
     if (kind > 4) {
@@ -2022,6 +2068,307 @@ static int parse_tags(Reader * r) {
   return 1;
 }
 
+static int ensure_function_names(Reader * r, uint32_t count) {
+  size_t bytes;
+  if (count <= r->mod->function_names_count) return 1;
+  GLWASM_Module *m=r->mod;
+  if(count>r->limits->functions)return fail_limit(r,"functions");
+  uint32_t capacity=m->function_names_capacity?m->function_names_capacity:8u;
+  while(capacity<count){
+    if(capacity>r->limits->functions/2u){capacity=r->limits->functions;break;}
+    capacity*=2u;
+  }
+  if(!array_size(capacity,sizeof(*m->function_names),&bytes))
+    return fail(r,GLWASM_ERR_OOM);
+  void *grown=gcu_allocator_realloc(r->alloc,m->function_names,
+      bytes);
+  if(!grown)return fail(r,GLWASM_ERR_OOM);
+  memset((GLWASM_Name *)grown+m->function_names_capacity,0,
+      (size_t)(capacity-m->function_names_capacity)*sizeof(*m->function_names));
+  m->function_names=grown;
+  m->function_names_capacity=capacity;
+  m->function_names_count=count;
+  return 1;
+}
+
+static int ensure_local_name_maps(Reader * r, uint32_t count) {
+  size_t bytes;
+  if (count <= r->mod->local_names_count) return 1;
+  GLWASM_Module *m=r->mod;
+  if(count>r->limits->functions)return fail_limit(r,"functions");
+  uint32_t capacity=m->local_names_capacity?m->local_names_capacity:8u;
+  while(capacity<count){
+    if(capacity>r->limits->functions/2u){capacity=r->limits->functions;break;}
+    capacity*=2u;
+  }
+  if(!array_size(capacity,sizeof(*m->local_names),&bytes))
+    return fail(r,GLWASM_ERR_OOM);
+  void *grown=gcu_allocator_realloc(r->alloc,m->local_names,
+      bytes);
+  if(!grown)return fail(r,GLWASM_ERR_OOM);
+  memset((GLWASM_LocalNameMap *)grown+m->local_names_capacity,0,
+      (size_t)(capacity-m->local_names_capacity)*sizeof(*m->local_names));
+  m->local_names=grown;
+  m->local_names_capacity=capacity;
+  m->local_names_count=count;
+  return 1;
+}
+
+static int prepare_debug_name(Reader *r,GLWASM_Name *name) {
+  if(!name||!name->bytes||!memchr(name->bytes,'\0',name->length))return 1;
+  size_t length=name->length;
+  for(uint32_t i=0;i<name->length;i++){
+    if(name->bytes[i]=='\0'){
+      /* Replace one embedded NUL byte with the six printable characters
+       * "\\u0000". */
+      if(length>SIZE_MAX-5u)return fail(r,GLWASM_ERR_OOM);
+      length+=5u;
+    }
+  }
+  if(length>UINT32_MAX||length==SIZE_MAX)
+    return fail_limit(r,"name_length");
+  char *display=gcu_allocator_malloc(&r->mod->alloc,length+1u);
+  if(!display)return fail(r,GLWASM_ERR_OOM);
+  size_t at=0;
+  for(uint32_t i=0;i<name->length;i++){
+    if(name->bytes[i]=='\0'){
+      memcpy(display+at,"\\u0000",6u);
+      at+=6u;
+    }else display[at++]=name->bytes[i];
+  }
+  display[at]='\0';
+  name->debug_bytes=display;
+  name->debug_length=(uint32_t)length;
+  return 1;
+}
+
+static uint32_t local_index_hash(uint32_t index) {
+  return index*UINT32_C(2654435761);
+}
+
+static void local_name_rebuild_index(GLWASM_LocalNameMap *map) {
+  if(!map->index_slots||!map->index_capacity)return;
+  memset(map->index_slots,0,(size_t)map->index_capacity*sizeof(*map->index_slots));
+  for(uint32_t i=0;i<map->count;i++){
+    uint32_t slot=local_index_hash(map->entries[i].index)&
+        (map->index_capacity-1u);
+    while(map->index_slots[slot])slot=(slot+1u)&(map->index_capacity-1u);
+    map->index_slots[slot]=i+1u;
+  }
+}
+
+static int local_name_reserve(Reader *r,GLWASM_LocalNameMap *map,
+    uint32_t needed) {
+  if(needed>r->limits->locals)return fail_limit(r,"locals");
+  if(needed>map->capacity){
+    uint32_t capacity=map->capacity?map->capacity:8u;
+    while(capacity<needed){
+      if(capacity>r->limits->locals/2u){capacity=r->limits->locals;break;}
+      capacity*=2u;
+    }
+    size_t entries_bytes=0;
+    if(!gcu_safe_mul_size((size_t)capacity,sizeof(*map->entries),
+        &entries_bytes))return fail(r,GLWASM_ERR_OOM);
+    void *grown=gcu_allocator_realloc(r->alloc,map->entries,
+        entries_bytes);
+    if(!grown)return fail(r,GLWASM_ERR_OOM);
+    map->entries=grown;
+    memset(map->entries+map->capacity,0,
+        (size_t)(capacity-map->capacity)*sizeof(*map->entries));
+    map->capacity=capacity;
+  }
+  if(!map->index_capacity||needed>map->index_capacity/2u){
+    uint32_t capacity=map->index_capacity?map->index_capacity:16u;
+    while(needed>capacity/2u){
+      if(capacity>UINT32_MAX/2u)return fail(r,GLWASM_ERR_OOM);
+      capacity*=2u;
+    }
+    size_t slots_bytes=0;
+    if(!gcu_safe_mul_size((size_t)capacity,sizeof(*map->index_slots),
+        &slots_bytes))return fail(r,GLWASM_ERR_OOM);
+    uint32_t *slots=gcu_allocator_malloc(r->alloc,
+        slots_bytes);
+    if(!slots)return fail(r,GLWASM_ERR_OOM);
+    gcu_allocator_free(r->alloc,map->index_slots);
+    map->index_slots=slots;
+    map->index_capacity=capacity;
+    local_name_rebuild_index(map);
+  }
+  return 1;
+}
+
+static int store_name_entry(Reader *r,GLWASM_LocalNameMap *map,
+    uint32_t index,GLWASM_Name *name) {
+  if(map->index_slots&&map->index_capacity){
+    uint32_t slot=local_index_hash(index)&(map->index_capacity-1u);
+    while(map->index_slots[slot]){
+      uint32_t existing=map->index_slots[slot]-1u;
+      if(map->entries[existing].index==index){
+        free_name(r->mod,name);
+        return 1;
+      }
+      slot=(slot+1u)&(map->index_capacity-1u);
+    }
+  }
+  if(!local_name_reserve(r,map,map->count+1u))return 0;
+  uint32_t slot=local_index_hash(index)&(map->index_capacity-1u);
+  while(map->index_slots[slot]){
+    uint32_t existing=map->index_slots[slot]-1u;
+    if(map->entries[existing].index==index){
+      free_name(r->mod,name);
+      return 1;
+    }
+    slot=(slot+1u)&(map->index_capacity-1u);
+  }
+  uint32_t entry=map->count++;
+  map->entries[entry].index=index;
+  map->entries[entry].name=*name;
+  name->bytes=NULL;name->length=0;name->debug_bytes=NULL;name->debug_length=0;
+  map->index_slots[slot]=entry+1u;
+  return 1;
+}
+
+static int parse_name_subsection_inner(Reader * r, uint8_t id) {
+  uint32_t count;
+  if (id == 0) {
+    GLWASM_Name name = {0};
+    if (!read_name(r, &name)) return 0;
+    if(!prepare_debug_name(r,&name)){free_name(r->mod,&name);return 0;}
+    if (r->p != r->end) {
+      free_name(r->mod, &name);
+      return fail(r, GLWASM_ERR_CORRUPT);
+    }
+    if (r->mod->module_name.bytes == NULL) r->mod->module_name = name;
+    else free_name(r->mod, &name);
+    return 1;
+  }
+  if (id == 1) {
+    if (!read_u32(r, &count) || count > r->limits->functions)
+      return r->err == GLWASM_OK ? fail_limit(r, "functions") : 0;
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t index;
+      GLWASM_Name name = {0};
+      if (!read_u32(r, &index) || index >= r->limits->functions ||
+          !ensure_function_names(r, index + 1u) || !read_name(r, &name)) {
+        free_name(r->mod, &name);
+        return r->err == GLWASM_OK ? fail(r, GLWASM_ERR_CORRUPT) : 0;
+      }
+      if(!prepare_debug_name(r,&name)){free_name(r->mod,&name);return 0;}
+      if (r->mod->function_names[index].bytes == NULL)
+        r->mod->function_names[index] = name;
+      else free_name(r->mod, &name);
+    }
+    return r->p == r->end ? 1 : fail(r, GLWASM_ERR_CORRUPT);
+  }
+  if (id == 2) {
+    if (!read_u32(r, &count) || count > r->limits->functions)
+      return r->err == GLWASM_OK ? fail_limit(r, "functions") : 0;
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t function_index, local_count;
+      if (!read_u32(r, &function_index) ||
+          function_index >= r->limits->functions ||
+          !ensure_local_name_maps(r, function_index + 1u) ||
+          !read_u32(r, &local_count) ||
+          local_count > r->limits->locals)
+        return r->err == GLWASM_OK ? fail_limit(r, "locals") : 0;
+      GLWASM_LocalNameMap * map = &r->mod->local_names[function_index];
+      for (uint32_t j = 0; j < local_count; j++) {
+        uint32_t local_index;
+        GLWASM_Name name = {0};
+        if (!read_u32(r, &local_index) || local_index >= r->limits->locals ||
+            !read_name(r, &name)) {
+          free_name(r->mod, &name);
+          return r->err == GLWASM_OK ? fail_limit(r, "locals") : 0;
+        }
+        if(!prepare_debug_name(r,&name)){free_name(r->mod,&name);return 0;}
+        if (!store_name_entry(r,map,local_index,&name)) {
+          free_name(r->mod, &name);
+          return 0;
+        }
+      }
+    }
+    return r->p == r->end ? 1 : fail(r, GLWASM_ERR_CORRUPT);
+  }
+  r->p = r->end;
+  return 1;
+}
+
+/* Optional debug metadata is accepted subsection by subsection. Parsing a
+ * malformed subsection must not publish a prefix of its entries. Keep the
+ * allocation growth (which is harmless) but roll back every name inserted by
+ * this subsection before the caller discards malformed metadata. */
+static int parse_name_subsection(Reader *r,uint8_t id) {
+  GLWASM_Module *m=r->mod;
+  uint8_t *function_had_name=NULL;
+  uint32_t *local_counts=NULL;
+  uint32_t old_function_count=m->function_names_count;
+  uint32_t old_local_count=m->local_names_count;
+  if(id==1&&old_function_count){
+    function_had_name=alloc_bytes(r,old_function_count);
+    if(!function_had_name)return 0;
+    for(uint32_t i=0;i<old_function_count;i++)
+      function_had_name[i]=m->function_names[i].bytes!=NULL;
+  }
+  if(id==2&&old_local_count){
+    size_t local_counts_bytes=0;
+    if(!gcu_safe_mul_size((size_t)old_local_count,sizeof(*local_counts),
+        &local_counts_bytes))
+      return fail(r,GLWASM_ERR_OOM);
+    local_counts=alloc_bytes(r,local_counts_bytes);
+    if(!local_counts){mod_free(m,function_had_name);return 0;}
+    for(uint32_t i=0;i<old_local_count;i++)
+      local_counts[i]=m->local_names[i].count;
+  }
+  int ok=parse_name_subsection_inner(r,id);
+  if(!ok&&id==1){
+    for(uint32_t i=0;i<m->function_names_count;i++){
+      bool existed=i<old_function_count&&function_had_name[i];
+      if(!existed){
+        free_name(m,&m->function_names[i]);
+        memset(&m->function_names[i],0,sizeof(m->function_names[i]));
+      }
+    }
+  }else if(!ok&&id==2){
+    for(uint32_t i=0;i<m->local_names_count;i++){
+      GLWASM_LocalNameMap *map=&m->local_names[i];
+      uint32_t keep=i<old_local_count?local_counts[i]:0;
+      while(map->count>keep){
+        free_name(m,&map->entries[map->count-1u].name);
+        memset(&map->entries[map->count-1u],0,
+            sizeof(map->entries[map->count-1u]));
+        map->count--;
+      }
+      local_name_rebuild_index(map);
+    }
+  }
+  mod_free(m,function_had_name);
+  mod_free(m,local_counts);
+  return ok;
+}
+
+static int parse_name_section(Reader * r) {
+  while (r->p < r->end) {
+    uint8_t id;
+    uint32_t size;
+    if (!read_byte(r, &id) || !read_u32(r, &size) ||
+        (size_t)(r->end - r->p) < size) {
+      if (r->err == GLWASM_OK) r->err = GLWASM_ERR_CORRUPT;
+      return 0;
+    }
+    const uint8_t * subsection_end = r->p + size;
+    if (id <= 2) {
+      const uint8_t * saved_end = r->end;
+      r->end = subsection_end;
+      int ok = parse_name_subsection(r, id);
+      r->end = saved_end;
+      if (!ok) return 0;
+    } else {
+      r->p = subsection_end;
+    }
+  }
+  return 1;
+}
+
 static int parse_custom(Reader * r) {
   GLWASM_Name name;
 
@@ -2029,7 +2376,15 @@ static int parse_custom(Reader * r) {
   if (!read_name(r, &name)) {
     return 0;
   }
+  int is_name = name.length == 4 && memcmp(name.bytes, "name", 4) == 0;
   mod_free(r->mod, name.bytes);
+  if (is_name && !parse_name_section(r)) {
+    /* Custom name metadata never changes whether a core module is valid. Keep
+     * any complete names already read and ignore a malformed optional tail. */
+    if (r->err == GLWASM_ERR_OOM) return 0;
+    r->err = GLWASM_OK;
+    r->limit = NULL;
+  }
   r->p = r->end;
   return 1;
 }
@@ -2227,6 +2582,7 @@ GLWASM_Result glwasm_module_decode(
     return GLWASM_ERR_OOM;
   }
   module->alloc = *alloc;
+  module->reference_count = 1;
   module->limits = *limits;
   memset(&r, 0, sizeof(r));
   r.p = bytes;
@@ -2264,6 +2620,23 @@ GLWASM_Result glwasm_module_decode(
       glwasm_module_destroy(module);
       write_failure(failure, tr, NULL);
       return tr;
+    }
+  }
+  uint64_t debug_id = atomic_fetch_add_explicit(&next_debug_module_id, 1,
+      memory_order_relaxed);
+  if (debug_id == 0 || debug_id > UINT32_MAX) {
+    glwasm_module_destroy(module);
+    write_failure(failure, GLWASM_ERR_LIMIT, NULL);
+    return GLWASM_ERR_LIMIT;
+  }
+  module->debug_id = (uint32_t)debug_id;
+  {
+    GLWASM_Result jit_result =
+        GHOTIIO_LANG_WASM(glwasm_jit_module_init)(module);
+    if (jit_result != GLWASM_OK) {
+      glwasm_module_destroy(module);
+      write_failure(failure, jit_result, NULL);
+      return jit_result;
     }
   }
   *out_module = module;

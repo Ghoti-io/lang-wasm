@@ -13,9 +13,8 @@
 #
 # Usage: check-symbols.sh <shared-library> <version-token> <root>
 #   <root> holds include/ and src/. The Makefile runs this against the real
-#   tree, and check-gates.sh runs the same script against tests/gates/symbols
-#   fixtures and small shared objects it builds, so that each check is seen
-#   to fail on a planted defect.
+#   tree. On Win64, check-symbols-pe-controls.sh also checks named, leaked,
+#   unnamed and split-import fixture DLLs against this same script.
 #
 # Fails on an empty population: a library exporting nothing means the gate
 # measured nothing.
@@ -32,7 +31,46 @@ if [ ! -f "$LIB" ]; then
   exit 1
 fi
 
-exported="$(nm -D --defined-only "$LIB" | awk '$2 ~ /^[TDBR]$/ {print $3}')"
+case "$LIB" in
+  *.dll)
+    # A PE DLL has no ELF dynamic symbol table. Read its actual export and
+    # import name tables; `nm -D` would report an empty population on Win64.
+    pe_dump="$(objdump -p "$LIB")" || {
+      printf 'check-symbols: cannot read PE tables from %s\n' "$LIB" >&2
+      exit 1
+    }
+    export_count="$(printf '%s\n' "$pe_dump" | awk '
+      /^[[:space:]]*Export Address Table[[:space:]]+[[:xdigit:]]+$/ {
+        print $NF; exit
+      }
+    ')"
+    named_count="$(printf '%s\n' "$pe_dump" | awk '
+      /^[[:space:]]*\[Name Pointer\/Ordinal\] Table[[:space:]]+[[:xdigit:]]+$/ {
+        print $NF; exit
+      }
+    ')"
+    if [ -z "$export_count" ] || [ -z "$named_count" ] ||
+        [ "$export_count" != "$named_count" ]; then
+      printf 'check-symbols: %s has unnamed PE exports or unreadable export counts\n' \
+        "$LIB" >&2
+      exit 1
+    fi
+    exported="$(printf '%s\n' "$pe_dump" | awk '
+      /^\[Ordinal\/Name Pointer\] Table/ { table=1; next }
+      table && /^[[:space:]]*\[[[:space:]]*[0-9]+\]/ {
+        print $NF; found=1; next
+      }
+      table && found { exit }
+    ')"
+    split="$(printf '%s\n' "$pe_dump" | awk '$2=="<none>" {print $4}' |
+      grep "^${TOKEN}_" || true)"
+    ;;
+  *)
+    exported="$(nm -D --defined-only "$LIB" | awk '$2 ~ /^[TDBR]$/ {print $3}')"
+    split="$(nm -D --undefined-only "$LIB" | awk '{print $2}' |
+      grep "^${TOKEN}_" || true)"
+    ;;
+esac
 if [ -z "$exported" ]; then
   printf 'check-symbols: %s exports no symbol at all; this gate is measuring nothing\n' \
     "$LIB" >&2
@@ -54,7 +92,6 @@ if [ -n "$unexported" ]; then
   exit 1
 fi
 
-split="$(nm -D --undefined-only "$LIB" | awk '{print $2}' | grep "^${TOKEN}_" || true)"
 if [ -n "$split" ]; then
   printf '### Renamed but undefined - a split symbol ###\n%s\n' "$split" >&2
   exit 1

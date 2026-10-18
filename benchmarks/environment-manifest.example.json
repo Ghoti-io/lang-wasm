@@ -1,0 +1,26 @@
+{
+  "compiler": "gcc",
+  "compiler_version": "16.2.0",
+  "compiler_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "cxx": "g++",
+  "cxx_version": "16.2.0",
+  "cxx_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "flags": "-O2 -std=c++17",
+  "build_commands": {
+    "c_compile": "gcc -O2 -std=c17 -c source.c -o source.o",
+    "cxx_compile": "g++ -O2 -std=c++17 -c benchmark.cpp -o benchmark.o",
+    "link": "g++ benchmark.o source.o -lruntime -o benchmark"
+  },
+  "image_id": "replace-with-container-image-digest",
+  "source_commit": "replace-with-lang-wasm-git-object-id",
+  "source_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "source_manifest_path": "source-manifest.json",
+  "machine": "replace-with-host-model",
+  "architecture": "x86_64",
+  "fixture_converter": "lang-wasm-wat-lower",
+  "fixture_converter_source_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "build_log_path": "raw.csv.build.log",
+  "build_log_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "kernel": "replace-with-kernel-version",
+  "cpu_model": "replace-with-cpu-model"
+}

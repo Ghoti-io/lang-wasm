@@ -73,6 +73,8 @@ GLWASM_Result glwasm_policy_preset(GLWASM_PolicyPreset preset,
   out->default_guest_depth = 256;
   out->default_native_depth = 64;
   out->default_memory_bytes = out->limits.memory_maximum;
+  out->max_jit_code_bytes = UINT64_C(16) * 1024 * 1024;
+  out->jit_disabled_cpu_features = GRJIT_FEATURES_ALL;
   if (preset >= GLWASM_POLICY_STANDARD) {
     out->features |= GLWASM_FEATURE_MEMORY64 | GLWASM_FEATURE_TABLE64 |
         GLWASM_FEATURE_MULTI_MEMORY | GLWASM_FEATURE_EXTENDED_CONST;
@@ -82,6 +84,7 @@ GLWASM_Result glwasm_policy_preset(GLWASM_PolicyPreset preset,
     out->limits.memory_initial = out->limits.memory_maximum;
     out->limits.table_size = UINT64_C(10000000);
     out->default_memory_bytes = out->limits.memory_maximum;
+    out->max_jit_code_bytes = UINT64_C(64) * 1024 * 1024;
   }
   if (preset == GLWASM_POLICY_TRUSTED) {
     out->limits.module_bytes = SIZE_MAX;
@@ -95,6 +98,7 @@ GLWASM_Result glwasm_policy_preset(GLWASM_PolicyPreset preset,
     out->limits.memory_maximum = UINT64_MAX;
     out->limits.memory_initial = UINT64_MAX;
     out->default_memory_bytes = UINT64_MAX;
+    out->max_jit_code_bytes = UINT64_C(256) * 1024 * 1024;
   }
   return GLWASM_OK;
 }
@@ -171,7 +175,9 @@ GLWASM_Result glwasm_module_decode_with_policy(const uint8_t *bytes,
     size_t length, const GLWASM_Policy *policy,
     const GLWASM_Allocator *allocator, GLWASM_Failure *failure,
     GLWASM_Module **out_module) {
-  if (!policy || !out_module) return GLWASM_ERR_INVALID;
+  if (!policy || !out_module || policy->allow_tang_v1_imports > 1u ||
+      (policy->jit_disabled_cpu_features & ~GRJIT_FEATURES_ALL))
+    return GLWASM_ERR_INVALID;
   GLWASM_Module *module = NULL;
   GLWASM_Result result = glwasm_module_decode(bytes, length, &policy->limits,
       allocator, failure, &module);
@@ -181,8 +187,17 @@ GLWASM_Result glwasm_module_decode_with_policy(const uint8_t *bytes,
     if (failure) { failure->result = GLWASM_ERR_UNSUPPORTED; failure->limit = NULL; }
     return GLWASM_ERR_UNSUPPORTED;
   }
+  /* The binary decoder initializes the default policy's module resources.
+   * Replace those with the caller's immutable cap before exposing the module. */
+  GHOTIIO_LANG_WASM(glwasm_jit_module_destroy)(module);
   module->policy = *policy;
   module->has_policy = 1;
+  result = GHOTIIO_LANG_WASM(glwasm_jit_module_init)(module);
+  if (result != GLWASM_OK) {
+    glwasm_module_destroy(module);
+    if (failure) { failure->result = result; failure->limit = NULL; }
+    return result;
+  }
   *out_module = module;
   return GLWASM_OK;
 }

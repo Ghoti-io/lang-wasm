@@ -17,6 +17,7 @@
 #include <ghoti.io/lang-wasm/core.h>
 #include <ghoti.io/lang-wasm/decode.h>
 #include <ghoti.io/lang-wasm/macros.h>
+#include <ghoti.io/lang-wasm/policy.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -31,16 +32,18 @@ typedef enum {
   GLWASM_TEXT_STRING
 } GLWASM_TextKind;
 
+/** Location of a token in the original UTF-8 source. */
 typedef struct GLWASM_SourceLoc {
-  size_t offset;
-  uint32_t line;
-  uint32_t column;
+  size_t offset; /**< Zero-based byte offset. */
+  uint32_t line; /**< One-based source line. */
+  uint32_t column; /**< One-based source column. */
 } GLWASM_SourceLoc;
 
+/** Source-located parse or lowering failure. Message storage is static. */
 typedef struct GLWASM_ParseError {
-  GLWASM_Result result;
-  GLWASM_SourceLoc location;
-  const char * message; /* Static description, never allocated. */
+  GLWASM_Result result; /**< Failure category. */
+  GLWASM_SourceLoc location; /**< Position that triggered the failure. */
+  const char * message; /**< Static description; caller must not free it. */
 } GLWASM_ParseError;
 
 /**
@@ -80,6 +83,12 @@ GLWASM_API GLWASM_Result glwasm_text_parse(const uint8_t * source,
  */
 GLWASM_API GLWASM_Result glwasm_wat_module_parse(
     const uint8_t * source, size_t length, const GLWASM_Limits * limits,
+    const GLWASM_Allocator * allocator, GLWASM_ParseError * error,
+    GLWASM_Module ** out_module);
+/** Parse and lower WAT, then validate and retain the supplied immutable
+ * policy exactly as ::glwasm_module_decode_with_policy does. */
+GLWASM_API GLWASM_Result glwasm_wat_module_parse_with_policy(
+    const uint8_t * source, size_t length, const GLWASM_Policy * policy,
     const GLWASM_Allocator * allocator, GLWASM_ParseError * error,
     GLWASM_Module ** out_module);
 /** @brief Lower verbatim WAT without removing annotation nodes. */

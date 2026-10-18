@@ -82,6 +82,7 @@ GLWASM_Limits loose();
 TEST(Policy, PresetsAndLimitOverridesReachTheDecoder) {
   GLWASM_Policy policy;
   ASSERT_EQ(glwasm_policy_preset(GLWASM_POLICY_UNTRUSTED, &policy), GLWASM_OK);
+  EXPECT_EQ(policy.allow_tang_v1_imports, 0u);
   EXPECT_EQ(policy.limits.module_bytes, 4u * 1024u * 1024u);
   EXPECT_FALSE(policy.features & GLWASM_FEATURE_MEMORY64);
   ASSERT_EQ(glwasm_policy_preset(GLWASM_POLICY_STANDARD, &policy), GLWASM_OK);
@@ -111,6 +112,233 @@ TEST(Policy, PresetsAndLimitOverridesReachTheDecoder) {
   EXPECT_EQ(glwasm_module_decode_with_policy(memory64.data(), memory64.size(),
       &policy, nullptr, nullptr, &module), GLWASM_OK);
   if (module) glwasm_module_destroy(module);
+}
+
+TEST(Decode, RetainsWasmNameSectionAndIgnoresMalformedOptionalNames) {
+  std::vector<uint8_t> bytes = hex(k_add);
+  const std::vector<uint8_t> names = hex(
+      "00 25 04 6e 61 6d 65 00 04 03 6d 6f 64 "
+      "01 06 01 00 03 61 64 64 "
+      "02 10 01 00 02 00 04 6c 65 66 74 01 05 72 69 67 68 74");
+  bytes.insert(bytes.end(), names.begin(), names.end());
+  const std::vector<uint8_t> duplicate_local = hex(
+      "00 17 04 6e 61 6d 65 02 10 01 00 02 00 04 6c 65 66 74 "
+      "00 05 6f 74 68 65 72");
+  bytes.insert(bytes.end(),duplicate_local.begin(),duplicate_local.end());
+  GLWASM_Limits limits = loose();
+  GLWASM_Module *module = nullptr;
+  ASSERT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), &limits, nullptr,
+      nullptr, &module), GLWASM_OK);
+  ASSERT_NE(module, nullptr);
+  ASSERT_NE(module->module_name.bytes, nullptr);
+  EXPECT_STREQ(module->module_name.bytes, "mod");
+  ASSERT_GT(module->function_names_count, 0u);
+  EXPECT_STREQ(module->function_names[0].bytes, "add");
+  ASSERT_GT(module->local_names_count, 0u);
+  ASSERT_EQ(module->local_names[0].count, 2u);
+  ASSERT_GT(module->local_names[0].index_capacity,0u);
+  EXPECT_STREQ(module->local_names[0].entries[0].name.bytes, "left");
+  EXPECT_STREQ(module->local_names[0].entries[1].name.bytes, "right");
+  glwasm_module_destroy(module);
+
+  bytes = hex(k_add);
+  const std::vector<uint8_t> malformed = hex(
+      "00 0a 04 6e 61 6d 65 01 04 01 00 04");
+  bytes.insert(bytes.end(), malformed.begin(), malformed.end());
+  module = nullptr;
+  EXPECT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), &limits, nullptr,
+      nullptr, &module), GLWASM_OK);
+  if (module) glwasm_module_destroy(module);
+
+  bytes = hex(k_add);
+  const std::vector<uint8_t> partial_function_names = hex(
+      "00 10 04 6e 61 6d 65 01 09 02 00 03 62 61 64 00 04 78");
+  bytes.insert(bytes.end(), partial_function_names.begin(),
+      partial_function_names.end());
+  module = nullptr;
+  ASSERT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), &limits, nullptr,
+      nullptr, &module), GLWASM_OK);
+  ASSERT_NE(module, nullptr);
+  ASSERT_GT(module->function_names_count, 0u);
+  EXPECT_EQ(module->function_names[0].bytes, nullptr);
+  glwasm_module_destroy(module);
+
+  bytes = hex(k_add);
+  const std::vector<uint8_t> partial_local_names = hex(
+      "00 11 04 6e 61 6d 65 02 0a 01 00 02 00 02 6f 6b 01 04 78");
+  bytes.insert(bytes.end(), partial_local_names.begin(),
+      partial_local_names.end());
+  module = nullptr;
+  ASSERT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), &limits, nullptr,
+      nullptr, &module), GLWASM_OK);
+  ASSERT_NE(module, nullptr);
+  ASSERT_GT(module->local_names_count, 0u);
+  EXPECT_EQ(module->local_names[0].count, 0u);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, FunctionLocalCountIncludesParameters) {
+  const std::vector<uint8_t> bytes = hex(
+      "00 61 73 6d 01 00 00 00 "
+      "01 07 01 60 02 7f 7f 01 7f "
+      "03 02 01 00 "
+      "0a 08 01 06 01 02 7f 20 00 0b");
+  GLWASM_Module *module = nullptr;
+  ASSERT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), nullptr, nullptr,
+      nullptr, &module), GLWASM_OK);
+  ASSERT_NE(module, nullptr);
+  ASSERT_EQ(module->nfuncs, 1u);
+  EXPECT_EQ(module->funcs[0].nparams, 2u);
+  /* Two parameters plus two declared locals occupy four local indices. */
+  EXPECT_EQ(module->funcs[0].nlocals, 4u);
+  ASSERT_NE(module->funcs[0].locals, nullptr);
+  for (uint32_t i = 0; i < module->funcs[0].nlocals; ++i)
+    EXPECT_EQ(module->funcs[0].locals[i].kind, GLWASM_VK_I32);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, LargeLocalNameMapsGrowGeometricallyAndUseIndexedLookup) {
+  auto append_uleb=[](std::vector<uint8_t> *bytes,uint32_t value){
+    do{
+      uint8_t byte=static_cast<uint8_t>(value&0x7fu);
+      value>>=7u;
+      if(value)byte|=0x80u;
+      bytes->push_back(byte);
+    }while(value);
+  };
+  std::vector<uint8_t> bytes=hex(k_add);
+  std::vector<uint8_t> names;
+  append_uleb(&names,4);
+  names.insert(names.end(),{'n','a','m','e'});
+  std::vector<uint8_t> locals;
+  append_uleb(&locals,1); // one function local-name map
+  append_uleb(&locals,0); // function zero
+  constexpr uint32_t entry_count=4096;
+  append_uleb(&locals,entry_count);
+  for(uint32_t i=0;i<entry_count;i++){
+    append_uleb(&locals,i);
+    append_uleb(&locals,1);
+    locals.push_back('x');
+  }
+  names.push_back(2); // local-name subsection
+  append_uleb(&names,static_cast<uint32_t>(locals.size()));
+  names.insert(names.end(),locals.begin(),locals.end());
+  bytes.push_back(0); // custom section
+  append_uleb(&bytes,static_cast<uint32_t>(names.size()));
+  bytes.insert(bytes.end(),names.begin(),names.end());
+
+  GLWASM_Limits limits=loose();
+  GLWASM_Module *module=nullptr;
+  ASSERT_EQ(glwasm_module_decode(bytes.data(),bytes.size(),&limits,nullptr,
+      nullptr,&module),GLWASM_OK);
+  ASSERT_NE(module,nullptr);
+  ASSERT_EQ(module->local_names[0].count,entry_count);
+  EXPECT_GE(module->local_names[0].capacity,entry_count);
+  EXPECT_GE(module->local_names[0].index_capacity,entry_count*2u);
+  uint32_t slot=(UINT32_C(4095)*UINT32_C(2654435761))&
+      (module->local_names[0].index_capacity-1u);
+  bool found=false;
+  while(module->local_names[0].index_slots[slot]){
+    const auto &entry=module->local_names[0].entries[
+        module->local_names[0].index_slots[slot]-1u];
+    if(entry.index==4095){
+      EXPECT_STREQ(entry.name.bytes,"x");
+      found=true;
+      break;
+    }
+    slot=(slot+1u)&(module->local_names[0].index_capacity-1u);
+  }
+  EXPECT_TRUE(found);
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, LargeAscendingFunctionNamesGrowGeometrically) {
+  auto append_uleb=[](std::vector<uint8_t> *bytes,uint32_t value){
+    do{
+      uint8_t byte=static_cast<uint8_t>(value&0x7fu);
+      value>>=7u;
+      if(value)byte|=0x80u;
+      bytes->push_back(byte);
+    }while(value);
+  };
+  std::vector<uint8_t> bytes=hex(k_add);
+  std::vector<uint8_t> names;
+  append_uleb(&names,4);
+  names.insert(names.end(),{'n','a','m','e'});
+  std::vector<uint8_t> functions;
+  constexpr uint32_t function_count=4096;
+  append_uleb(&functions,function_count);
+  for(uint32_t i=0;i<function_count;i++){
+    append_uleb(&functions,i);
+    append_uleb(&functions,1);
+    functions.push_back('x');
+  }
+  names.push_back(1); // function-name subsection
+  append_uleb(&names,static_cast<uint32_t>(functions.size()));
+  names.insert(names.end(),functions.begin(),functions.end());
+  bytes.push_back(0); // custom section
+  append_uleb(&bytes,static_cast<uint32_t>(names.size()));
+  bytes.insert(bytes.end(),names.begin(),names.end());
+
+  GLWASM_Limits limits=loose();
+  GLWASM_Module *module=nullptr;
+  ASSERT_EQ(glwasm_module_decode(bytes.data(),bytes.size(),&limits,nullptr,
+      nullptr,&module),GLWASM_OK);
+  ASSERT_NE(module,nullptr);
+  EXPECT_EQ(module->function_names_count,function_count);
+  EXPECT_GE(module->function_names_capacity,function_count);
+  EXPECT_STREQ(module->function_names[function_count-1u].bytes,"x");
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, DebugNamesEscapeEmbeddedNulBytesWithoutChangingCoreNames) {
+  std::vector<uint8_t> bytes=hex(k_add);
+  const std::vector<uint8_t> names={
+    0x00,0x1e,0x04,'n','a','m','e',
+    0x00,0x05,0x04,'m','o',0x00,'d',
+    0x01,0x06,0x01,0x00,0x03,'a',0x00,'b',
+    0x02,0x08,0x01,0x00,0x01,0x00,0x03,'x',0x00,'y'};
+  bytes.insert(bytes.end(),names.begin(),names.end());
+  GLWASM_Limits limits=loose();
+  GLWASM_Module *module=nullptr;
+  ASSERT_EQ(glwasm_module_decode(bytes.data(),bytes.size(),&limits,nullptr,
+      nullptr,&module),GLWASM_OK);
+  ASSERT_NE(module,nullptr);
+  ASSERT_EQ(module->module_name.length,4u);
+  EXPECT_EQ(module->module_name.bytes[2],'\0');
+  ASSERT_NE(module->module_name.debug_bytes,nullptr);
+  EXPECT_STREQ(module->module_name.debug_bytes,"mo\\u0000d");
+  EXPECT_EQ(module->module_name.debug_length,
+      std::strlen(module->module_name.debug_bytes));
+  ASSERT_NE(module->function_names[0].debug_bytes,nullptr);
+  EXPECT_STREQ(module->function_names[0].debug_bytes,"a\\u0000b");
+  EXPECT_EQ(module->function_names[0].debug_length,
+      std::strlen(module->function_names[0].debug_bytes));
+  ASSERT_NE(module->local_names[0].entries[0].name.debug_bytes,nullptr);
+  EXPECT_STREQ(module->local_names[0].entries[0].name.debug_bytes,
+      "x\\u0000y");
+  EXPECT_EQ(module->local_names[0].entries[0].name.debug_length,
+      std::strlen(module->local_names[0].entries[0].name.debug_bytes));
+  glwasm_module_destroy(module);
+}
+
+TEST(Decode, EscapesEmbeddedNulBytesInExportNamesForDebuggerDisplay) {
+  std::vector<uint8_t> bytes=hex(k_add);
+  const uint8_t export_section[]={
+    0x07,0x07,0x01,0x03,'m',0x00,'x',0x00,0x00};
+  bytes.insert(bytes.begin()+21,std::begin(export_section),
+      std::end(export_section));
+  GLWASM_Limits limits=loose();
+  GLWASM_Module *module=nullptr;
+  ASSERT_EQ(glwasm_module_decode(bytes.data(),bytes.size(),&limits,nullptr,
+      nullptr,&module),GLWASM_OK);
+  ASSERT_NE(module,nullptr);
+  ASSERT_EQ(module->nexports,1u);
+  ASSERT_NE(module->exports[0].name.debug_bytes,nullptr);
+  EXPECT_STREQ(module->exports[0].name.debug_bytes,"m\\u0000x");
+  EXPECT_EQ(module->exports[0].name.debug_length,
+      std::strlen(module->exports[0].name.debug_bytes));
+  glwasm_module_destroy(module);
 }
 
 GLWASM_Limits loose() {
@@ -372,7 +600,8 @@ TEST(Decode, TranslationOffsetsAreTotalMonotonicAndInRange) {
   ASSERT_EQ(translated->offset_count, translated->nins + 1u);
   ASSERT_EQ(translated->nins, module->funcs[0].nins);
   for (uint32_t i = 0; i < translated->offset_count; ++i) {
-    EXPECT_LT(translated->offsets[i], bytes.size());
+    if (i < translated->nins) EXPECT_LT(translated->offsets[i], bytes.size());
+    else EXPECT_LE(translated->offsets[i], bytes.size());
     if (i != 0) {
       EXPECT_LE(translated->offsets[i - 1], translated->offsets[i]);
     }
@@ -449,7 +678,7 @@ TEST(Decode, RuntimeRunsStartAndUsesPortableArithmeticShift) {
   glwasm_module_destroy(module);
 }
 
-TEST(Decode, RuntimeRejectsMultiResultCalleeAndClearsOutputOnFailure) {
+TEST(Decode, RuntimePropagatesMultiResultCalleeAndClearsOutputOnFailure) {
   static const char wat[] =
       "(module (func (result i32 i32) (i32.const 1) (i32.const 2)) "
       "(func (export \"run\") (result i32) (drop (call 0))))";
@@ -461,8 +690,8 @@ TEST(Decode, RuntimeRejectsMultiResultCalleeAndClearsOutputOnFailure) {
   GLWASM_Runtime *runtime = nullptr;
   ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
   uint64_t value = 0;
-  EXPECT_EQ(glwasm_runtime_invoke(runtime, 1, nullptr, 0, &value),
-      GLWASM_ERR_UNSUPPORTED);
+  EXPECT_EQ(glwasm_runtime_invoke(runtime, 1, nullptr, 0, &value), GLWASM_OK);
+  EXPECT_EQ(value, 1u);
   glwasm_runtime_destroy(runtime);
   glwasm_module_destroy(module);
 
@@ -1064,16 +1293,19 @@ TEST(Decode, ZeroTypesRefusesOneType) {
   EXPECT_EQ(module, reinterpret_cast<GLWASM_Module *>(1));
 }
 
-TEST(Decode, UnboundedMemoryHitsTheMaximum) {
+TEST(Decode, UnboundedMemoryDefersTheHostCapUntilAllocation) {
   std::vector<uint8_t> bytes = hex(
       "00 61 73 6d 01 00 00 00 05 03 01 00 01");
   GLWASM_Failure failure;
   GLWASM_Module * module = reinterpret_cast<GLWASM_Module *>(1);
 
   EXPECT_EQ(glwasm_module_decode(bytes.data(), bytes.size(), NULL, NULL,
-      &failure, &module), GLWASM_ERR_LIMIT);
-  EXPECT_STREQ(failure.limit, "memory_maximum");
-  EXPECT_EQ(module, reinterpret_cast<GLWASM_Module *>(1));
+      &failure, &module), GLWASM_OK);
+  ASSERT_NE(module, nullptr);
+  ASSERT_EQ(module->nmems, 1u);
+  EXPECT_FALSE(module->mems[0].has_max);
+  EXPECT_EQ(module->mems[0].min, 1u);
+  glwasm_module_destroy(module);
 }
 
 TEST(Decode, LocalIndexSpaceOverflowIsMalformed) {

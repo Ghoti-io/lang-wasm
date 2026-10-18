@@ -1,0 +1,4 @@
+# file<TAB>SHA-256<TAB>source
+licenses/SQLite-3.54.1-notice.txt	1cd2306d3d867293dad6e52a9e58afb45917ccb00f9f3b33c428c3c677ede625	SQLite 3.54.1 sqlite3.c dedication
+licenses/zlib-1.3.2-LICENSE.txt	e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2	zlib 1.3.2 LICENSE
+licenses/Lua-5.5.1-license.html	5fb06a2e4f568c48dc512298608bb1273559886b69ec91bdd64ceea526689b31	Lua 5.5.1 doc/readme.html license section

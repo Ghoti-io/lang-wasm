@@ -47,10 +47,11 @@ typedef enum GLWASM_CommandKind {
   GLWASM_COMMAND_ASSERT_INVALID_CUSTOM
 } GLWASM_CommandKind;
 
+/** One classified WAST command; its syntax belongs to the parsed script. */
 typedef struct GLWASM_Command {
-  GLWASM_CommandKind kind;
-  GLWASM_SourceLoc location;
-  const GLWASM_Text * syntax; /* Borrowed from the owning script. */
+  GLWASM_CommandKind kind; /**< Command category. */
+  GLWASM_SourceLoc location; /**< Source position of the command. */
+  const GLWASM_Text * syntax; /**< Borrowed from the owning script. */
 } GLWASM_Command;
 
 /**

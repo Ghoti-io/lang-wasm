@@ -129,10 +129,11 @@ static GLWASM_Result translate_func(GLWASM_Module * module,
       labels[active[--depth]].end = i;
     }
   }
-  /* Every position includes the terminal boundary. It maps to the final
-   * instruction's opcode byte, which is in range and keeps the map monotone. */
+  /* Every position includes the terminal boundary after the final `end`
+   * opcode. The terminal is a useful resume position, but is not itself an
+   * executable instruction boundary. */
   translated->offsets[function->nins] =
-      translated->offsets[function->nins - 1u];
+      translated->offsets[function->nins - 1u] + 1u;
   depth = 1;
   for (i = 0; i < function->nins; ++i) {
     GLWASM_Instr * source = &function->ins[i];

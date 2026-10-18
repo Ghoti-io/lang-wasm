@@ -312,6 +312,39 @@ TEST(WasmWatLowering, NamedParameterLowersEquivalentToBinaryModule) {
   fclose(a);fclose(b);glwasm_module_destroy(from_text);glwasm_module_destroy(from_binary);
 }
 
+TEST(WasmWatLowering, TrustedPolicyGrowsNamedLocalTableOnDemand) {
+  std::string wat="(module (func (result i32)";
+  for(unsigned i=0;i<12;++i)
+    wat+=" (local $n"+std::to_string(i)+" i32)";
+  wat+=" (i32.const 7) (local.set $n11) (local.get $n11)))";
+  GLWASM_Policy policy{};
+  ASSERT_EQ(glwasm_policy_preset(GLWASM_POLICY_TRUSTED,&policy),GLWASM_OK);
+  GLWASM_Module*module=nullptr;
+  GLWASM_ParseError error{};
+  ASSERT_EQ(glwasm_wat_module_parse_with_policy(
+      reinterpret_cast<const uint8_t*>(wat.data()),wat.size(),&policy,
+      nullptr,&error,&module),GLWASM_OK) << error.message;
+  ASSERT_NE(module,nullptr);
+  ASSERT_EQ(module->nfuncs,1u);
+  EXPECT_EQ(module->funcs[0].nlocals,12u);
+  bool saw_set=false,saw_get=false;
+  for(uint32_t i=0;i<module->funcs[0].nins;++i){
+    const GLWASM_Instr&ins=module->funcs[0].ins[i];
+    if(ins.op==0x21&&ins.a==11)saw_set=true;
+    if(ins.op==0x20&&ins.a==11)saw_get=true;
+  }
+  EXPECT_TRUE(saw_set);
+  EXPECT_TRUE(saw_get);
+  glwasm_module_destroy(module);
+
+  policy.limits.locals=8;
+  module=nullptr;
+  EXPECT_EQ(glwasm_wat_module_parse_with_policy(
+      reinterpret_cast<const uint8_t*>(wat.data()),wat.size(),&policy,
+      nullptr,&error,&module),GLWASM_ERR_LIMIT);
+  EXPECT_EQ(module,nullptr);
+}
+
 TEST(WasmWatLowering, LowersTagAndThrow) {
   const std::string wat="(module (tag $oops (param i32)) (func (param i32) local.get 0 throw $oops))";
   GLWASM_Module *module=nullptr;GLWASM_ParseError error{};

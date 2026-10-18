@@ -1,0 +1,12 @@
+# tool<TAB>version<TAB>platform<TAB>archive SHA-256 or immutable image digest
+# wasi-clang rows bind the installed compiler identity to the matching verified SDK archive.
+native-gcc	16.2.0	linux/amd64	sha256:3f73339bf0d3d64081cac3f6d9fdafc6dd4cef2b9c49e0a09f91e97cb0eb139a
+native-gcc	16.2.0	linux/arm64	sha256:325784a7e64cece62cc2ba202f8ee9e9b6e09dbcecabe98697a79a41148b177a
+wasi-sdk	34.0	linux/x86_64	b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
+wasi-sdk	34.0	linux/aarch64	f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971
+wasi-clang	34.0	linux/x86_64	b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
+wasi-clang	34.0	linux/aarch64	f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971
+wasmtime	49.0.3	linux/x86_64	4001225413f208345b980525f31c4080e1873808b38d0ddc7918497340667fbb
+wasmtime	49.0.3	linux/aarch64	880fcb026da88ad7fc1713d572b0d03d139758b7da96cd3cb8c9cbf847a521df
+wasmtime-c-api	49.0.3	linux/x86_64	49c9641ac1f6158ed90404115315b36a9ae68338acda16fcf00f0819622ccd97
+wasmtime-c-api	49.0.3	linux/aarch64	fb9c1a101c092cd3b4536ddb4c68ae31ad70d78bbdbc408d0e007f05a2fdd409

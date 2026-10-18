@@ -72,6 +72,9 @@ typedef struct VState {
   uint32_t fcap;
   uint8_t * local_initialized;
   uint32_t nlocal_initialized;
+  GLWASM_Func * function;
+  uint32_t max_stack;
+  uint32_t max_control_depth;
 } VState;
 
 static GLWASM_ValType num_type(uint8_t kind) {
@@ -330,6 +333,8 @@ static int push_val(VState * v, GLWASM_ValType t) {
   }
   v->stack = grown;
   v->stack[v->nstack++] = t;
+  if (!v->is_const && v->function && v->nstack > v->max_stack)
+    v->max_stack = v->nstack;
   return 1;
 }
 
@@ -407,6 +412,9 @@ static int push_frame(VState * v, VFrame frame) {
   }
   v->frames = grown;
   v->frames[v->nframes++] = frame;
+  if (!v->is_const && v->function &&
+      v->nframes - 1u > v->max_control_depth)
+    v->max_control_depth = v->nframes - 1u;
   return 1;
 }
 
@@ -1260,6 +1268,9 @@ static int validate_expr_body(VState * v, GLWASM_Func * fn, int is_const,
   v->nstack = 0;
   v->nframes = 0;
   v->is_const = is_const;
+  v->function = is_const ? NULL : fn;
+  v->max_stack = 0;
+  v->max_control_depth = 0;
   memset(&frame, 0, sizeof(frame));
   frame.kind = GLWASM_V_FUNC;
   frame.params = params;
@@ -1284,6 +1295,10 @@ static int validate_expr_body(VState * v, GLWASM_Func * fn, int is_const,
     if (!val_sub(v->mod, v->stack[i], results[i])) {
       return fail(v, GLWASM_ERR_VALIDATE);
     }
+  }
+  if (!is_const) {
+    fn->max_stack = v->max_stack;
+    fn->max_control_depth = v->max_control_depth;
   }
   return 1;
 }

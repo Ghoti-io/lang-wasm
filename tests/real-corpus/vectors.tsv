@@ -1,0 +1,4 @@
+# workload<TAB>case<TAB>status<TAB>byte-length<TAB>output-hex-file
+sqlite	default	1	74	vectors/sqlite.hex
+zlib	default	1	4096	vectors/zlib.hex
+lua	default	1	182	vectors/lua.hex

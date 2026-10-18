@@ -1,13 +1,16 @@
 # Design
 
-**Status:** Stories 1–10 and 12 are implemented. Story 11's pinned SQLite,
-zlib, and Lua corpus passed 12/12 ordinary cases and 18/18 relocation cases
-on EVO-X2 and native Pi arm64, including Story 11's exact 12/18-case corpus
-selection guard. Story 13's separate full-library Google Test selection
-wrapper is undergoing final source-matched gates; timed measurements and
-cross-architecture confirmation remain open. Production Tang loader integration
-belongs to Tang Story 14, and the cross-heap handle table belongs to Tang's
-host-extensibility Story 13.
+**Status:** Stories 1–13 are implemented, measured, and accepted under the
+documented feature scope. The final independent documentation review passed.
+Story 11's pinned SQLite, zlib, and Lua corpus passed 12/12
+ordinary cases and 18/18 relocation cases on EVO-X2 and native Pi arm64,
+including the exact 12/18-case corpus selection guard. Story 13 has completed
+cross-architecture gates, the corrected runtime-jit and Lang-Wasm sanitizer
+gates, Tang torture, and source-matched 30-sample native Pi and quiet-host
+EVO-X2 measurements. A final native Pi documentation-snapshot `make test`
+passed 273/273 with zero skips.
+Production Tang loader integration belongs to Tang Story 14, and the
+cross-heap handle table belongs to Tang's host-extensibility Story 13.
 
 `lang-wasm` decodes a WebAssembly 3.0 binary, validates it, then translates
 validated functions for execution on runtime-core.
@@ -726,19 +729,31 @@ and command lines are specified in `benchmarks/README.md`; the benchmark is
 opt-in and does not make the ordinary build network-dependent.
 
 As of 2026-10-18, the five exact Wasm fixture hashes agree between X2 and
-Pi source snapshots. Earlier rebuilt-image native, Wine Win64, and qemu
-AArch64 snapshots passed; post-wrapper ordinary, sanitizer, GC-torture,
-Valgrind, relocation, and cross gates remain open on the current source.
-Early timed X2/Pi samples have
-completed with 30 paired samples per measured tier and workload. Their
-steady-state medians favor compiled execution in all listed fixtures, as
-recorded with raw data and provenance in the Story 13 measurement matrix.
-Final source-matched, quiet-host timing remains open, so the early sample set
-does not establish a general JIT performance claim. The
-benchmark's `mixed-boundary` tier is
-hybrid: the outer loop is compiled and its nested instance is interpreted.
-Current measurements are intentionally limited to the listed loop, call,
-linear-memory, table/bulk, and mixed-boundary workloads; they do not establish
-performance for every Wasm module or host callback pattern. A general JIT
-benefit can be claimed only after equivalent-work semantic checks and the
-required per-workload comparisons are complete.
+Pi source snapshots. The documented implementation snapshots passed ordinary
+suites on GCC 16 X2 and native Pi 4, the complete Wine Win64 and qemu AArch64
+cross gates, Valgrind, GC torture, fuzz replay, and installed-consumer checks.
+The matrix identifies each snapshot and its subsequent source differences.
+The corrected pinned real-program corpus passed on both machines in ordinary
+and relocating-heap modes, including all 18 relocation cases and matching
+native and Wasmtime vectors. The Story 13 measurement matrix records the
+source snapshots, image identities, named skips, gate ledgers, and retained
+logs; an earlier aggregate corpus failure caused by a stale Makefile checksum
+is recorded there and superseded by the corrected-source corpus jobs.
+
+The final-source Pi run contains 30 paired samples per tier and workload.
+Its median interpreter to compiled speedups were 14.33x for numeric loops,
+2.47x for calls, 10.27x for linear memory, and 2.83x for table/bulk; the
+mixed-boundary hybrid was 2.20x faster than its interpreter comparison. The
+attached-idle debugger's median cost ranged by workload, including an
+observed 8.9% increase for calls. The quiet-host X2 run used the same source
+manifest and 30 paired samples per tier and workload. Its median interpreter
+to compiled speedups were 16.19x for numeric loops, 3.65x for calls, 12.60x
+for linear memory, and 3.63x for table/bulk; the mixed-boundary hybrid was
+2.47x faster than its interpreter comparison. Attached-idle debugger medians
+were within 0.2% of unattached interpreter medians on these X2 workloads.
+Raw data, min/median/p95/max, first-call and poll-event measurements,
+commands, and provenance are retained in the measurement bundles cited by
+the matrix. The `mixed-boundary` tier is hybrid: the outer loop is compiled
+and its nested instance is interpreted. These measurements cover the listed
+fixtures and do not establish performance for every Wasm module or callback
+pattern.

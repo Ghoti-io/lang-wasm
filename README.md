@@ -246,20 +246,30 @@ inputs. See [the benchmark protocol](benchmarks/README.md) for setup, exact
 commands, raw artifact requirements, workload definitions, and summaries.
 
 As of 2026-10-18, the five canonical Wasm module hashes match between X2 and
-Pi. Earlier native GCC 16 source snapshots passed the ordinary, GC-torture,
-installed-consumer, pinned WAST, and 12-case real-program corpus gates on both
-machines. The native X2 and Pi relocation corpus gates each passed all 18
-cases. The full Wine and qemu AArch64 cross gates passed and were fetched from
-earlier snapshots. A later audit hardened full-suite Google Test selection,
-so post-wrapper ordinary, ASan/UBSan, TSan, GC-torture, Valgrind, relocation,
-and cross gates remain open,
-as do final source-matched, quiet-host benchmark distributions.
-Early 30-sample paired measurements on X2 and Pi show compiled medians below
-interpreter medians for the loop, call, memory, and table/bulk fixtures; the
-hybrid mixed-boundary fixture is faster than its interpreter comparison.
-These samples have retained raw data and provenance, but the final source and
-quiet-host timing pass remains open. Interpret performance per workload.
-The mixed-boundary `hybrid` workload measures a
+Pi. Native GCC 16 ordinary tests, GC torture, Valgrind, fuzz replay, and the
+installed-consumer check passed on the committed implementation snapshot.
+Wine Win64 and qemu AArch64 gates passed on earlier implementation snapshots;
+their only subsequent executable-source differences are the Windows Tang test
+adjustment and the pinned corpus checksum correction, respectively. The
+corrected source-matched runtime-jit and Lang-Wasm ASan/UBSan and TSan gates
+passed. Tang's ordinary and GC-torture gates passed after its planted-control
+filter was narrowed to the tests that run under torture.
+The corrected pinned real-program corpus passed in ordinary and relocating
+heap modes on X2 and native Pi 4; the relocation arm ran all 18 cases with
+matching native and Wasmtime vectors. The Story 13 measurement matrix records
+the exact gate snapshots, skips, and the earlier superseded checksum failure.
+The final-source Pi benchmark has 30 paired samples per tier and workload;
+the four fully compiled workload medians favor JIT by 2.47x–14.33x.
+The mixed-boundary hybrid median favors its interpreter comparison by 2.20x.
+The quiet-host X2 benchmark used the same source manifest and 30 paired
+samples per tier and workload. Its median speedups were 16.19x for numeric
+loops, 3.65x for calls, 12.60x for linear memory, 3.63x for table/bulk, and
+2.47x for the hybrid mixed boundary. Attached-idle debugger medians were
+within 0.2% of the unattached interpreter medians on these X2 workloads.
+Interpret performance per workload and consult the retained raw data,
+provenance, first-call latency, and debugger polling distributions before
+drawing broader conclusions. The mixed-boundary
+`hybrid` workload measures a
 compiled outer loop that calls an interpreted nested instance; it is not a
 whole-workload JIT comparison. First-call latency and debugger polling
 diagnostics are separate from steady-state timing.

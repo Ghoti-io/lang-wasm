@@ -489,9 +489,6 @@ typedef struct Run {
   GLWASM_Result error; GLWASM_Trap trap; int active; int paused;
 } Run;
 
-static int global_reference_valid(const Run *r,uint32_t index,
-    uint64_t token);
-
 static void diagnostic_record_frame_entry(Run *run, uint32_t function,
     uint64_t sp, uint64_t base);
 
@@ -2729,10 +2726,6 @@ static uint32_t wasm_jit_table_bulk(void *environment, uint64_t function,
   if (distinct_source) table_release(&src_lease);
   table_release(&dst_lease);
   return valid ? 0u : 1u;
-}
-static int global_reference_valid(const Run *r,uint32_t index,uint64_t token) {
-  return index < r->m->nglobals &&
-      global_value_valid(r->store, r->instance->globals[index], token);
 }
 
 /* Grow a memory by `delta` pages, within its own type, the address space,

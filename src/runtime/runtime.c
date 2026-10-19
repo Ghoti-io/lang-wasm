@@ -748,36 +748,6 @@ static uint32_t wasm_jit_deopt(void *opaque_context, uint64_t cause) {
   size_t rebuilt = 0;
   size_t keep = cause == 2u ? 0u : SIZE_MAX;
   jit_record_active_nested_deopts(runtime, cause);
-  /* The rebuild writes slots, not identities: each compiled frame's guest
-   * frame still has the identity it was pushed with, its function's entry.
-   * Give it its compiled frame's (a caller's call site, the innermost
-   * frame's exit site) before the rebuild clears the record. Only a poll
-   * sets the innermost identity itself, and a named exit is not a poll:
-   * the interpreter resumes that instruction without polling it again. */
-  {
-    GRCORE_Stack *stack = grcore_context_stack(context);
-    const size_t frame_count = grcore_stack_frame_count(stack);
-    GRCORE_CompiledWalk walk;
-    GRCORE_CompiledFrame frame;
-    if (frame_count && grcore_compiled_walk_begin(context, &walk) == GRCORE_OK) {
-      GRCORE_FrameRef guest = grcore_stack_top(stack);
-      size_t guest_index = frame_count - 1u, record = 0;
-      int any = 0;
-      while (grcore_compiled_walk_next(&walk, &frame) == GRCORE_CWALK_FRAME) {
-        if (any && frame.record != record) break; /* not this rebuild's run */
-        any = 1;
-        record = frame.record;
-        const size_t index = frame.base_frames - 1u +
-            (frame.run_length - 1u - frame.run_depth);
-        while (guest_index > index) {
-          guest = grcore_stack_caller(stack, guest);
-          --guest_index;
-        }
-        if (index < frame_count)
-          (void)grcore_stack_set_identity(stack, guest, frame.identity);
-      }
-    }
-  }
   GRCORE_Result result = grcore_compiled_rebuild(context,
       reservation, keep, &rebuilt);
   if (result == GRCORE_OK) runtime->jit_deopt_cause = cause;

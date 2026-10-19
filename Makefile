@@ -264,6 +264,10 @@ WASMLIBRARY := -Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-ar
 TEST_WASMLIBRARY := $(WASMLIBRARY) $(RDBG_LIBS) $(RHEAP_LIBS)
 
 ifeq ($(OS_NAME), Windows)
+# The presets' native-stack budget (4 MiB) is more than a MinGW executable's
+# default stack reserve (2 MB), so a compiled recursion would fault before it
+# reached the budget. 16 MB is reserved address space, committed as used.
+LDFLAGS += -Wl,--stack,16777216
 TEST_LDFLAGS := -Wl,--wrap=__mingw_fprintf
 else
 TEST_LDFLAGS :=

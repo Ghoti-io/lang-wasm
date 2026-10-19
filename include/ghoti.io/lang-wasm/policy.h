@@ -41,7 +41,12 @@ typedef struct GLWASM_Policy {
    * Compiled recursion that would pass it leaves to the interpreter at the
    * call, where the guest depth limit then applies. UINT64_MAX is no
    * budget, and then nothing runs compiled: there is nothing to bound
-   * compiled recursion with. Presets use 1 MiB. */
+   * compiled recursion with. Presets use 4 MiB: the real-program corpus's
+   * SQLite workload needs more than 1 MiB and no more than 2 to run with
+   * no exit. The thread that runs the instance needs more stack than this,
+   * for the C code under compiled code (Linux's main and glibc threads have
+   * 8 MiB; a Windows executable's default reserve is 1 or 2 MiB, so lower it
+   * there or link with a larger reserve, as these test programs do). */
   uint64_t default_native_stack_bytes;
   uint64_t default_memory_bytes; /**< Default runtime-core memory budget. */
   /** Privileged Tang boundary imports require both this capability and an

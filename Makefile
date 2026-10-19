@@ -48,7 +48,7 @@ WASM_SPEC_DIR ?= ../runtime-jit/third_party/wasm-spec/$(WASM_SPEC_COMMIT)
 export GLWASM_WAST_CORPUS_ROOT := $(abspath $(WASM_SPEC_DIR)/test)
 export GLWASM_WAST_CLASSIFICATION := $(abspath tests/data-wast-classification.tsv)
 export GLWASM_WAST_ASSERTION_SKIPS := $(abspath tests/data-wast-assertion-skips.tsv)
-export GLWASM_WAST_EXECUTION_BASELINE := $(abspath tests/data-wast-execution-baseline.tsv)
+export GLWASM_WAST_JIT_RULES := $(abspath tests/data-wast-jit-rules.tsv)
 export GLWASM_WAST_SPEC_COMMIT := $(WASM_SPEC_COMMIT)
 
 UNAME_S := $(shell uname -s)
@@ -472,6 +472,11 @@ test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES) check-gtest-full ##
 		printf '\n### Running %s ###\n\n' "$$test_name"; \
 		LD_LIBRARY_PATH="$(TEST_LD_PATH)" tools/run-gtest-full.sh $$test_exe || exit 1; \
 	done
+
+SPEC_SUITE_APP := $(APP_DIR)/testSpec_suite$(EXE_EXTENSION)
+.PHONY: test-spec-suite
+test-spec-suite: $(APP_DIR)/$(TARGET) $(SPEC_SUITE_APP) ## Run only the pinned spec suite, in both tiers
+	LD_LIBRARY_PATH="$(TEST_LD_PATH)" tools/run-gtest-full.sh $(SPEC_SUITE_APP)
 
 test-quiet: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) ## Run tests, one line per suite
 	@for test_exe in $(TEST_EXECUTABLES); do \

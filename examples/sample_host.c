@@ -43,13 +43,19 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  /* The store's budgets are the policy's: a runaway plugin runs out of
+   * fuel and comes back paused, never unbounded. */
+  GLWASM_Store *store = NULL;
+  result = glwasm_store_create(&policy, &store);
   GLWASM_Runtime *runtime = NULL;
-  GLWASM_LinkError link_error = {0};
-  result = glwasm_runtime_create_with_imports(module, NULL, 0, 1,
-      &link_error, &runtime);
+  GLWASM_InstantiateError error = {0};
+  if (result == GLWASM_OK)
+    result = glwasm_store_instantiate(store, module, NULL, 0, 1, &error,
+        &runtime);
+  glwasm_module_destroy(module);
   if (result != GLWASM_OK) {
     fprintf(stderr, "plugin instance failed: %s\n", glwasm_result_string(result));
-    glwasm_module_destroy(module);
+    glwasm_store_destroy(store);
     return 1;
   }
 
@@ -65,11 +71,9 @@ int main(int argc, char **argv) {
       puts("plugin paused");
   } else {
     fprintf(stderr, "plugin returned: %s\n", glwasm_result_string(result));
-    glwasm_runtime_destroy(runtime);
-    glwasm_module_destroy(module);
+    glwasm_store_destroy(store);
     return 1;
   }
-  glwasm_runtime_destroy(runtime);
-  glwasm_module_destroy(module);
+  glwasm_store_destroy(store);
   return 0;
 }

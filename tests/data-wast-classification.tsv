@@ -233,7 +233,7 @@ test/core/simd/simd_store16_lane.wast	skip(simd)
 test/core/simd/simd_store32_lane.wast	skip(simd)
 test/core/simd/simd_store64_lane.wast	skip(simd)
 test/core/simd/simd_store8_lane.wast	skip(simd)
-test/core/skip-stack-guard-page.wast	skip(non-core)
+test/core/skip-stack-guard-page.wast	run
 test/core/stack.wast	run
 test/core/start.wast	run
 test/core/store.wast	run

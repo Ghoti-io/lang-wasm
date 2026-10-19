@@ -12,6 +12,7 @@
 
 #include <ghoti.io/lang-wasm/decode.h>
 #include <ghoti.io/lang-wasm/macros.h>
+#include <ghoti.io/lang-wasm/policy.h>
 #include <ghoti.io/runtime-core/b/context.h>
 #include <ghoti.io/runtime-core/a/engine.h>
 #include <stddef.h>
@@ -21,8 +22,46 @@
 extern "C" {
 #endif
 
+/** A store: the runtime-core context, budgets and every object (function,
+ * table, memory, global, tag) that its instances define or import. Linked
+ * instances share one store; a call into another instance's function is an
+ * ordinary guest call in the same context. */
+typedef struct GLWASM_Store GLWASM_Store;
+/** One instance of a module in a store. The store owns it. */
 typedef struct GLWASM_Runtime GLWASM_Runtime;
 typedef struct GLWASM_Snapshot GLWASM_Snapshot;
+
+/** The kind of a store object, numbered as the binary format's export kinds. */
+typedef enum GLWASM_ExternKind {
+  GLWASM_EXTERN_FUNC = 0,
+  GLWASM_EXTERN_TABLE = 1,
+  GLWASM_EXTERN_MEMORY = 2,
+  GLWASM_EXTERN_GLOBAL = 3,
+  GLWASM_EXTERN_TAG = 4
+} GLWASM_ExternKind;
+
+/** A reference to one object of a store, as an export yields it. It is
+ * valid for the store's lifetime and only with that store. */
+typedef struct GLWASM_Extern {
+  const GLWASM_Store *store; /**< The owning store. */
+  uint8_t kind;              /**< ::GLWASM_ExternKind. */
+  uint32_t address;          /**< Object index within the store, per kind. */
+} GLWASM_Extern;
+
+/** Why guest execution trapped. The suite's messages name each one. */
+typedef enum GLWASM_Trap {
+  GLWASM_TRAP_NONE = 0,
+  GLWASM_TRAP_UNREACHABLE,               /**< "unreachable" */
+  GLWASM_TRAP_DIVIDE_BY_ZERO,            /**< "integer divide by zero" */
+  GLWASM_TRAP_INTEGER_OVERFLOW,          /**< "integer overflow" */
+  GLWASM_TRAP_TABLE_OUT_OF_BOUNDS,       /**< "out of bounds table access" */
+  GLWASM_TRAP_UNINITIALIZED_ELEMENT,     /**< "uninitialized element" */
+  GLWASM_TRAP_INDIRECT_CALL_TYPE_MISMATCH, /**< "indirect call type mismatch" */
+  GLWASM_TRAP_MEMORY_OUT_OF_BOUNDS,      /**< "out of bounds memory access" */
+  GLWASM_TRAP_INVALID_REFERENCE,         /**< a null or foreign exnref */
+  GLWASM_TRAP_UNDEFINED_ELEMENT,         /**< "undefined element" */
+  GLWASM_TRAP_INVALID_CONVERSION         /**< "invalid conversion to integer" */
+} GLWASM_Trap;
 
 /** Identity of a Wasm exception that crossed an adopted runtime-core
  * boundary. `identity` is an opaque token owned by the originating runtime;
@@ -96,21 +135,23 @@ typedef GLWASM_Result (*GLWASM_HostFunctionResults)(
 typedef GLWASM_Result (*GLWASM_HostResumeFunctionResults)(
     const GLWASM_HostCall *call, uint64_t *results);
 
-/** An explicit capability granted to one exact function, memory, table,
- * global, or exception-tag import. */
+/** An explicit capability granted to one exact import: a host function,
+ * memory, table, global or exception tag, or an object of the same store
+ * exported by another instance (::GLWASM_HOST_IMPORT_EXTERN). */
 typedef struct GLWASM_HostImport {
   const char *module; /**< Exact import module name; borrowed at link time. */
   const char *field; /**< Exact import field name; borrowed at link time. */
   GLWASM_HostFunction function; /**< Scalar callback for a function import. */
   GLWASM_HostResumeFunction resume; /**< Scalar continuation after pause. */
-  void *user; /**< Borrowed callback/provider state; outlives the instance. */
-  uint8_t kind; /**< GLWASM_HOST_IMPORT_*; zero preserves function imports. */
+  void *user; /**< Borrowed callback/provider state; outlives the store. */
+  uint8_t kind; /**< GLWASM_HOST_IMPORT_*. */
   union {
     struct GLWASM_HostMemoryProvider *memory;
     struct GLWASM_HostTableProvider *table;
     struct GLWASM_HostGlobal *global;
     struct GLWASM_HostTag *tag;
-  } resource; /**< Provider for the selected non-function import kind. */
+    GLWASM_Extern linked; /**< For ::GLWASM_HOST_IMPORT_EXTERN. */
+  } resource; /**< The object for every import kind but a host function. */
   /** Optional result-slice callbacks. When set, these take precedence over
    * the scalar callbacks above and support all declared result values. The
    * result array length is `call->result_count`; `result_types` gives its
@@ -118,6 +159,13 @@ typedef struct GLWASM_HostImport {
   GLWASM_HostFunctionResults function_results;
   /** Result-slice continuation paired with `function_results` after pause. */
   GLWASM_HostResumeFunctionResults resume_results;
+  /** A host function's type. The import links only when its declared type
+   * is exactly this one ("incompatible import type" otherwise). The arrays
+   * are copied at link time. */
+  const GLWASM_HostValueType *parameters;
+  uint32_t parameter_count;
+  const GLWASM_HostValueType *results;
+  uint32_t result_count;
 } GLWASM_HostImport;
 
 enum {
@@ -125,7 +173,8 @@ enum {
   GLWASM_HOST_IMPORT_MEMORY = 1,
   GLWASM_HOST_IMPORT_TABLE = 2,
   GLWASM_HOST_IMPORT_GLOBAL = 3,
-  GLWASM_HOST_IMPORT_TAG = 4
+  GLWASM_HOST_IMPORT_TAG = 4,
+  GLWASM_HOST_IMPORT_EXTERN = 5
 };
 
 /**
@@ -144,12 +193,18 @@ typedef void (*GLWASM_HostMemoryEnd)(void *user,
     GLWASM_HostMemoryView *view);
 typedef GLWASM_Result (*GLWASM_HostMemoryGrow)(void *user, uint64_t delta_pages,
     uint64_t *old_pages);
-/** Host-owned memory import with short-lived access leases. */
+/** Host-owned memory import with short-lived access leases. The declared
+ * type is what an import is matched against: the current size must reach
+ * the import's minimum, and an import with a maximum needs a declared
+ * maximum no larger than it. */
 typedef struct GLWASM_HostMemoryProvider {
   GLWASM_HostMemoryBegin begin; /**< Open and pin a memory view. */
   GLWASM_HostMemoryEnd end; /**< Close the matching view. */
   GLWASM_HostMemoryGrow grow; /**< Grow by pages outside a lease. */
-  void *user; /**< Borrowed provider state; outlives the instance. */
+  void *user; /**< Borrowed provider state; outlives the store. */
+  uint64_t maximum_pages; /**< Declared maximum, when has_maximum. */
+  uint8_t has_maximum; /**< Nonzero when the memory has a maximum. */
+  uint8_t address64; /**< Nonzero for a 64-bit (memory64) memory. */
 } GLWASM_HostMemoryProvider;
 
 /**
@@ -169,14 +224,19 @@ typedef void (*GLWASM_HostTableEnd)(void *user,
 typedef GLWASM_Result (*GLWASM_HostTableGrow)(void *user, uint64_t delta,
     uint64_t initial, uint64_t *old_size);
 typedef GLWASM_Result (*GLWASM_HostReferenceCheck)(void *user, uint64_t token);
-/** Host-owned table import with rooted, short-lived token views. */
+/** Host-owned table import with rooted, short-lived token views. Funcref
+ * tokens in it are the store's own (see ::glwasm_store_funcref); the
+ * declared type is matched as for a memory. */
 typedef struct GLWASM_HostTableProvider {
   GLWASM_HostTableBegin begin; /**< Open and root a table view. */
   GLWASM_HostTableEnd end; /**< Close the matching view. */
   GLWASM_HostTableGrow grow; /**< Grow by elements outside a lease. */
   GLWASM_HostValueType element_type; /**< Declared reference element type. */
   GLWASM_HostReferenceCheck validate_token; /**< Reject stale/foreign tokens. */
-  void *user; /**< Borrowed provider state; outlives the instance. */
+  void *user; /**< Borrowed provider state; outlives the store. */
+  uint64_t maximum; /**< Declared maximum element count, when has_maximum. */
+  uint8_t has_maximum; /**< Nonzero when the table has a maximum. */
+  uint8_t address64; /**< Nonzero for a 64-bit (table64) table. */
 } GLWASM_HostTableProvider;
 
 /** Host-owned global import backed by a borrowed value slot. */
@@ -200,10 +260,11 @@ typedef struct GLWASM_HostTag {
 } GLWASM_HostTag;
 
 typedef enum GLWASM_LinkFailure {
-  GLWASM_LINK_UNRESOLVED = 0,
-  GLWASM_LINK_UNSUPPORTED_KIND,
-  GLWASM_LINK_INVALID_BINDING,
-  GLWASM_LINK_START_NOT_ALLOWED
+  GLWASM_LINK_UNRESOLVED = 0,     /**< "unknown import": no binding names it. */
+  GLWASM_LINK_UNSUPPORTED_KIND,   /**< The binding's kind cannot be imported. */
+  GLWASM_LINK_INVALID_BINDING,    /**< The binding is incomplete or malformed. */
+  GLWASM_LINK_START_NOT_ALLOWED,  /**< A start function, and allow_start is 0. */
+  GLWASM_LINK_INCOMPATIBLE        /**< "incompatible import type". */
 } GLWASM_LinkFailure;
 
 /** Import diagnostic. Names are borrowed from the module. */
@@ -213,35 +274,106 @@ typedef struct GLWASM_LinkError {
   GLWASM_LinkFailure reason; /**< Failure category. */
 } GLWASM_LinkError;
 
+/** Where an instantiation stopped. */
+typedef enum GLWASM_InstantiateStage {
+  GLWASM_INSTANTIATE_COMPLETE = 0, /**< It did not stop: the instance exists. */
+  GLWASM_INSTANTIATE_LINK,         /**< An import did not link (see `link`). */
+  GLWASM_INSTANTIATE_ALLOCATE,     /**< A budget or limit refused an object. */
+  GLWASM_INSTANTIATE_SEGMENTS,     /**< An element or data segment trapped. */
+  GLWASM_INSTANTIATE_START         /**< The start function trapped or failed. */
+} GLWASM_InstantiateStage;
+
+/** Why an instantiation failed. */
+typedef struct GLWASM_InstantiateError {
+  GLWASM_InstantiateStage stage; /**< Where it stopped. */
+  GLWASM_LinkError link;         /**< For ::GLWASM_INSTANTIATE_LINK. */
+  GLWASM_Trap trap;              /**< For a trap in segments or start. */
+} GLWASM_InstantiateError;
+
 /**
- * Link every function import against the explicit allowlist and instantiate.
- * Imports without an exact entry are denied. `tang.*` additionally requires
- * the decoded module policy's privileged Tang capability; only `tang.v1` is
- * accepted, and the exact versioned import module must still be supplied. This
- * first host API supports function imports; imported memories, tables, globals
- * and tags use provider entries with matching type and limits.
- *
- * `allow_start` must be true to run a module's start function. The instance
- * retains `module`; the caller may release its module handle after successful
- * creation, and the module is freed after both caller and instance references
- * are released. Binding strings need remain valid only through instantiation;
- * callback pointers and user pointers are copied into the instance. Provider
- * structs, provider state, imported global slots, and callback user state must
- * outlive that instance.
+ * Create an empty store. Its runtime-core context takes its budgets (fuel,
+ * guest and native call depth, memory bytes) from `policy`'s runtime fields;
+ * NULL means the untrusted preset. A module's own decoded policy still
+ * governs its features, limits, JIT and privileged imports.
  */
-GLWASM_API GLWASM_Result glwasm_runtime_create_with_imports(
+GLWASM_API GLWASM_Result glwasm_store_create(const GLWASM_Policy *policy,
+    GLWASM_Store **out_store);
+
+/** Destroy a store, every instance in it, and every object they made. The
+ * store must not be running or paused inside a host callback. */
+GLWASM_API void glwasm_store_destroy(GLWASM_Store *store);
+
+/** The store's borrowed runtime-core context, valid until the store is
+ * destroyed; inspect it only while readable and on its owner thread. */
+GLWASM_API GRCORE_Context * glwasm_store_context(const GLWASM_Store *store);
+
+/** Replace the fuel left for the store's next and current runs. */
+GLWASM_API GLWASM_Result glwasm_store_set_fuel(GLWASM_Store *store,
+    uint64_t fuel);
+
+/**
+ * Instantiate `module` in `store`, linking each import to the binding that
+ * names its exact module and field. Imports without a binding are denied.
+ * A binding of kind ::GLWASM_HOST_IMPORT_EXTERN links an object another
+ * instance of the same store exported; the others supply host objects.
+ * Each import's declared type must match its object exactly, with the
+ * spec's limits matching for tables and memories. `tang.*` additionally
+ * requires the decoded module policy's privileged Tang capability; only
+ * `tang.v1` is accepted.
+ *
+ * Instantiation follows the spec's order: link, allocate, apply the element
+ * segments then the data segments in order, run the start function (when
+ * `allow_start`; otherwise a start function fails to link). A trap in a
+ * segment or in start fails the instantiation, but what the instance had
+ * already written into imported tables and memories stays written, and its
+ * functions stay valid wherever it placed them: the store keeps it. No
+ * instance is returned then, and `error` says where and why.
+ *
+ * The store retains `module`. Binding strings and type arrays need remain
+ * valid only through this call; provider structs, provider state, imported
+ * global slots and callback user state must outlive the store.
+ */
+GLWASM_API GLWASM_Result glwasm_store_instantiate(GLWASM_Store *store,
     GLWASM_Module *module, const GLWASM_HostImport *imports,
-    size_t import_count, int allow_start, GLWASM_LinkError *link_error,
+    size_t import_count, int allow_start, GLWASM_InstantiateError *error,
     GLWASM_Runtime **out_runtime);
 
-/** Release an instance and its retained module reference. */
-GLWASM_API void glwasm_runtime_destroy(GLWASM_Runtime *runtime);
+/** The store an instance belongs to. */
+GLWASM_API GLWASM_Store * glwasm_runtime_store(const GLWASM_Runtime *runtime);
 
-/** The instance's borrowed runtime-core context. It is valid until the runtime
- * is destroyed and may be inspected only while the context is readable and
- * held by its owner thread. */
+/** The store's runtime-core context, as ::glwasm_store_context. */
 GLWASM_API GRCORE_Context * glwasm_runtime_context(
     const GLWASM_Runtime *runtime);
+
+/** Look up an export by its exact `length`-byte name. */
+GLWASM_API GLWASM_Result glwasm_runtime_export(const GLWASM_Runtime *runtime,
+    const char *name, size_t length, GLWASM_Extern *out_extern);
+
+/** Read a global's current value as Wasm value bits. */
+GLWASM_API GLWASM_Result glwasm_store_global_get(const GLWASM_Store *store,
+    GLWASM_Extern global, uint64_t *value);
+/** Write a mutable global. A reference value must be valid for its type. */
+GLWASM_API GLWASM_Result glwasm_store_global_set(GLWASM_Store *store,
+    GLWASM_Extern global, uint64_t value);
+
+/** A memory's current size in bytes. */
+GLWASM_API GLWASM_Result glwasm_store_memory_size(const GLWASM_Store *store,
+    GLWASM_Extern memory, uint64_t *bytes);
+/** Copy `size` bytes out of a memory at `offset`. A host function may call
+ * this during its callback, which is how it reads guest pointers. */
+GLWASM_API GLWASM_Result glwasm_store_memory_read(const GLWASM_Store *store,
+    GLWASM_Extern memory, uint64_t offset, void *buffer, size_t size);
+/** Copy `size` bytes into a memory at `offset`. */
+GLWASM_API GLWASM_Result glwasm_store_memory_write(GLWASM_Store *store,
+    GLWASM_Extern memory, uint64_t offset, const void *buffer, size_t size);
+
+/** The funcref token of a function object: what a funcref value, a table
+ * element or a host funcref argument carries. Zero is the null reference. */
+GLWASM_API GLWASM_Result glwasm_store_funcref(const GLWASM_Store *store,
+    GLWASM_Extern function, uint64_t *token);
+
+/** The trap that ended the store's last invocation, or ::GLWASM_TRAP_NONE. */
+GLWASM_API GLWASM_Trap glwasm_store_last_trap(const GLWASM_Store *store);
 
 /** Invoke a function by module function index using Wasm value bit patterns. */
 GLWASM_API GLWASM_Result glwasm_runtime_invoke(GLWASM_Runtime *runtime,

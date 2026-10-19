@@ -1461,9 +1461,14 @@ static GLWASM_Result wat_module_parse_impl(const uint8_t*s,size_t n,
     for(size_t i=first_field;i<glwasm_text_size(root);i++){
       const GLWASM_Text*field=at(root,i);
       int importing=atom(at(field,0),"import")||inline_import(field)!=NULL;
-      if(annotation_node(field)||atom(at(field,0),"type"))continue;
+      /* The text format's ordering rule: every import precedes the first
+       * function, table, memory, global or tag definition. Types, rec
+       * groups, exports, start, elem and data may appear anywhere. */
+      if(annotation_node(field))continue;
       if(importing&&saw_definition){malformed_error(e,field,"import follows a module definition");r=GLWASM_ERR_CORRUPT;goto done;}
-      if(!importing)saw_definition=1;
+      if(!importing&&(atom(at(field,0),"func")||atom(at(field,0),"table")||
+          atom(at(field,0),"memory")||atom(at(field,0),"global")||
+          atom(at(field,0),"tag")))saw_definition=1;
     }
   }
   if(duplicate_module_names(root,first_field,"func","duplicate function identifier",e)||
@@ -2140,9 +2145,12 @@ elem_bad:
         inline_memory_index++;continue;
       }
       if(!atom(at(x,0),"data"))continue;
-      int passive=glwasm_text_size(x)==1||glwasm_text_kind(at(x,1))!=GLWASM_TEXT_LIST,explicit_memory=0;uint32_t memory=0;size_t offindex=1,strindex=2;uint8_t flag=passive?1:0;Bytes offset={0},payload={0};
-      if(passive)strindex=1;
-      if(!passive&&atom(at(at(x,1),0),"memory")){if(glwasm_text_size(at(x,1))!=2||!resolve_index(at(at(x,1),1),memoryrefs,nmemoryrefs,&memory)){r=GLWASM_ERR_UNSUPPORTED;goto data_bad;}explicit_memory=1;flag=2;offindex=2;strindex=3;}
+      /* (data $id? (memory x)? offset? string*): the identifier names the
+       * segment and is never part of its bytes. */
+      const size_t base=named_atom(at(x,1))?2:1;
+      int passive=glwasm_text_size(x)==base||glwasm_text_kind(at(x,base))!=GLWASM_TEXT_LIST,explicit_memory=0;uint32_t memory=0;size_t offindex=base,strindex=base+1;uint8_t flag=passive?1:0;Bytes offset={0},payload={0};
+      if(passive)strindex=base;
+      if(!passive&&atom(at(at(x,base),0),"memory")){if(glwasm_text_size(at(x,base))!=2||!resolve_index(at(at(x,base),1),memoryrefs,nmemoryrefs,&memory)){r=GLWASM_ERR_UNSUPPORTED;goto data_bad;}explicit_memory=1;flag=2;offindex=base+1;strindex=base+2;}
       const GLWASM_Text*offset_expr=at(x,offindex);
       if(!passive&&atom(at(offset_expr,0),"offset")){
         for(size_t oi=1;oi<glwasm_text_size(offset_expr);oi++){
@@ -2155,6 +2163,9 @@ elem_bad:
         if(!put(&offset,0x0b))goto data_bad;
       }
       for(size_t si=strindex;si<glwasm_text_size(x);si++){
+        if(glwasm_text_kind(at(x,si))!=GLWASM_TEXT_STRING){
+          free(offset.p);free(payload.p);malformed_error(e,at(x,si),"data segment contents must be strings");r=GLWASM_ERR_CORRUPT;goto done;
+        }
         size_t chunk;const uint8_t*part=glwasm_text_bytes(at(x,si),&chunk);
         if((!part&&chunk)||chunk>UINT32_MAX-payload.n||!bytes(&payload,part,chunk))goto data_bad;
       }

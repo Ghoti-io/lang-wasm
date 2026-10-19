@@ -563,15 +563,22 @@ static int check_memory(Reader * r, const LimInfo * lim) {
     return fail(r, GLWASM_ERR_VALIDATE);
   }
 
+  /* 2^48 pages is 2^64 bytes, one past uint64_t. A cap of UINT64_MAX is
+   * no cap, so it admits that endpoint as it does for the maximum below. */
   if (lim->min > UINT64_MAX / GLWASM_PAGE) {
-    return fail_limit(r, "memory_initial");
+    if (r->limits->memory_initial != UINT64_MAX)
+      return fail_limit(r, "memory_initial");
+    if (r->limits->memory_maximum != UINT64_MAX)
+      return fail_limit(r, "memory_maximum");
   }
-  min_bytes = lim->min * GLWASM_PAGE;
-  if (min_bytes > r->limits->memory_initial) {
-    return fail_limit(r, "memory_initial");
-  }
-  if (min_bytes > r->limits->memory_maximum) {
-    return fail_limit(r, "memory_maximum");
+  else {
+    min_bytes = lim->min * GLWASM_PAGE;
+    if (min_bytes > r->limits->memory_initial) {
+      return fail_limit(r, "memory_initial");
+    }
+    if (min_bytes > r->limits->memory_maximum) {
+      return fail_limit(r, "memory_maximum");
+    }
   }
   /* An omitted maximum leaves the Wasm-declared limit unconstrained (up to
    * the core-spec address limit). The host's memory_maximum is enforced on

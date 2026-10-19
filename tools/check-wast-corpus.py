@@ -25,7 +25,7 @@ FEATURE_MARKERS = {
     "relaxed-simd": re.compile(r"relaxed[_\.]"),
     "threads": re.compile(r"atomic\.|memory\.atomic|shared"),
     "legacy-exceptions": re.compile(r"\b(?:try|catch|rethrow|delegate)\b"),
-    "non-core": re.compile(r"@(?:custom|metadata|name|code)|stack.guard.page"),
+    "non-core": re.compile(r"@(?:custom|metadata|name|code)"),
 }
 
 
@@ -805,7 +805,7 @@ def main() -> None:
             continue
         if reason == "legacy-exceptions" and "/legacy/exceptions/" in relative:
             continue
-        if reason == "non-core" and ("/custom/" in relative or relative.endswith("skip-stack-guard-page.wast")):
+        if reason == "non-core" and "/custom/" in relative:
             continue
         try:
             source = (corpus_root.parent / path).read_text(encoding="utf-8")

@@ -491,7 +491,7 @@ GLWASM_Result glwasm_jit_lower_function(GLWASM_Module *module,
     uintptr_t indirect_target_helper, uintptr_t host_call_helper,
     uintptr_t table_bulk_helper, uintptr_t memory_bulk_helper,
     uintptr_t exception_take_helper, uintptr_t exception_throw_helper,
-    uintptr_t exception_throw_ref_helper,
+    uintptr_t exception_throw_ref_helper, uintptr_t funcref_helper,
     GRJIT_Code **out_code,
     uint16_t *unsupported_opcode, uint32_t *failure_pc,
     uint32_t *failure_jit_result, uint16_t *failure_opcode,
@@ -504,7 +504,7 @@ GLWASM_Result glwasm_jit_lower_function(GLWASM_Module *module,
       !slot_entry_helper || !indirect_target_helper || !host_call_helper ||
       !table_bulk_helper || !memory_bulk_helper ||
       !exception_take_helper || !exception_throw_helper ||
-      !exception_throw_ref_helper ||
+      !exception_throw_ref_helper || !funcref_helper ||
       !out_code)
     return GLWASM_ERR_INVALID;
   GLWASM_JitCacheKey cache_key;
@@ -1199,8 +1199,16 @@ GLWASM_Result glwasm_jit_lower_function(GLWASM_Module *module,
             ? (uint32_t)instruction.c
             : instruction.op == 0x43 ? instruction.a : instruction.c;
         if (instruction.op == 0xd0) token = 0;
-        if (instruction.op == 0xd2) token = (uint64_t)instruction.a + 1u;
-        if (jr == GRJIT_OK) jr = grjit_builder_const(builder, value,
+        if (instruction.op == 0xd2) {
+          /* A funcref is a store address, and the module's code serves
+           * every instance, so the instance supplies its token. */
+          GRJIT_Operand args[2] = {grjit_operand_vreg(instance),
+              grjit_operand_imm(instruction.a)};
+          if (jr == GRJIT_OK)
+            jr = grjit_builder_call(builder, value, (uint64_t)funcref_helper,
+                GRJIT_CALL_NO_GC, GRCORE_SITE_GC_POINT_CALL, args, 2,
+                identity, NULL, 0);
+        } else if (jr == GRJIT_OK) jr = grjit_builder_const(builder, value,
             (int64_t)token);
         if (jr != GRJIT_OK) { result = map_jit_result_capture(jr, failure_jit_result); if (failure_site) *failure_site = __LINE__; goto done; }
         if (stack_count >= max_stack) { result = GLWASM_ERR_INTERNAL; if (failure_site) *failure_site = __LINE__; goto done; }
@@ -1677,6 +1685,88 @@ GLWASM_Result glwasm_jit_lower_function(GLWASM_Module *module,
         stack[stack_count - 1u] = (GLWASM_JitValue){value, output_type};
         break;
       }
+      case 0xa8: case 0xa9: case 0xaa: case 0xab:
+      case 0xae: case 0xaf: case 0xb0: case 0xb1: {
+        /* A trapping truncation of an in-range input equals the saturating
+         * one. NaN and out-of-range inputs take the trap exit, and the
+         * interpreter raises the precise trap. */
+        if (!stack_count) { result = GLWASM_ERR_INTERNAL; if (failure_site) *failure_site = __LINE__; goto done; }
+        uint32_t sub = instruction.op <= 0xabu ? instruction.op - 0xa8u
+            : instruction.op - 0xaau;
+        int source64 = sub == 2u || sub == 3u || sub == 6u || sub == 7u;
+        int dest64 = sub >= 4u, is_unsigned = (int)(sub & 1u);
+        GRJIT_Type input_type = source64 ? GRJIT_TYPE_F64 : GRJIT_TYPE_F32;
+        type = dest64 ? GRJIT_TYPE_I64 : GRJIT_TYPE_I32;
+        if (stack[stack_count - 1u].type != input_type) {
+          side_exit = 1; break;
+        }
+        /* Valid inputs lie in (low, high), or [low, high) when low is
+         * itself representable and in range. Every bound is exact in both
+         * float widths, and ordered comparisons reject NaN. */
+        double low = is_unsigned ? -1.0 : dest64 ? -9223372036854775808.0
+            : source64 ? -2147483649.0 : -2147483648.0;
+        int low_inclusive = !is_unsigned && (dest64 || !source64);
+        double high = is_unsigned
+            ? (dest64 ? 18446744073709551616.0 : 4294967296.0)
+            : (dest64 ? 9223372036854775808.0 : 2147483648.0);
+        int64_t low_bits, high_bits;
+        if (source64) {
+          memcpy(&low_bits, &low, sizeof(low_bits));
+          memcpy(&high_bits, &high, sizeof(high_bits));
+        } else {
+          float low_f = (float)low, high_f = (float)high;
+          uint32_t low_u, high_u;
+          memcpy(&low_u, &low_f, sizeof(low_u));
+          memcpy(&high_u, &high_f, sizeof(high_u));
+          low_bits = low_u;
+          high_bits = high_u;
+        }
+        GRJIT_VReg input = stack[stack_count - 1u].reg, low_reg, high_reg,
+            above, below, in_range;
+        jr = grjit_builder_vreg(builder, input_type, &low_reg);
+        if (jr == GRJIT_OK) jr = grjit_builder_const(builder, low_reg, low_bits);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_vreg(builder, input_type, &high_reg);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_const(builder, high_reg, high_bits);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_vreg(builder, GRJIT_TYPE_I32, &above);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_cmp(builder,
+              low_inclusive ? GRJIT_CMP_GE : GRJIT_CMP_GT, above,
+              grjit_operand_vreg(input), grjit_operand_vreg(low_reg));
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_vreg(builder, GRJIT_TYPE_I32, &below);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_cmp(builder, GRJIT_CMP_LT, below,
+              grjit_operand_vreg(input), grjit_operand_vreg(high_reg));
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_vreg(builder, GRJIT_TYPE_I32, &in_range);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_binary(builder, GRJIT_OP_AND, in_range,
+              grjit_operand_vreg(above), grjit_operand_vreg(below));
+        GRJIT_BlockId safe_block, exit_block;
+        if (jr == GRJIT_OK) jr = grjit_builder_block(builder, &safe_block);
+        if (jr == GRJIT_OK) jr = grjit_builder_block(builder, &exit_block);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_br_if(builder, grjit_operand_vreg(in_range),
+              safe_block, exit_block);
+        if (jr == GRJIT_OK) jr = grjit_builder_set_block(builder, exit_block);
+        if (jr == GRJIT_OK)
+          result = emit_trap_exit(builder, function_index, instruction.op,
+              trap_exit_helper, instance, identity, state, slot_count,
+              signature);
+        if (jr == GRJIT_OK && result != GLWASM_OK) jr = GRJIT_ERR_INTERNAL;
+        if (jr == GRJIT_OK) jr = grjit_builder_set_block(builder, safe_block);
+        if (jr == GRJIT_OK) jr = grjit_builder_vreg(builder, type, &value);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_unary(builder, is_unsigned
+              ? GRJIT_OP_TRUNC_SAT_U : GRJIT_OP_TRUNC_SAT_S, value,
+              grjit_operand_vreg(input));
+        if (jr != GRJIT_OK) { result = map_jit_result_capture(jr, failure_jit_result); if (failure_site) *failure_site = __LINE__; goto done; }
+        stack[stack_count - 1u] = (GLWASM_JitValue){value, type};
+        break;
+      }
       case 0xfc00: case 0xfc01: case 0xfc02: case 0xfc03:
       case 0xfc04: case 0xfc05: case 0xfc06: case 0xfc07: {
         if (!stack_count) { result = GLWASM_ERR_INTERNAL; if (failure_site) *failure_site = __LINE__; goto done; }
@@ -1936,6 +2026,133 @@ GLWASM_Result glwasm_jit_lower_function(GLWASM_Module *module,
         }
         stack[stack_count - 1u] =
             (GLWASM_JitValue){grow_result, address_type};
+        break;
+      }
+      case 0x25: case 0x26: case 0x3f:
+      case 0xfc09: case 0xfc0d: case 0xfc0f: case 0xfc10: {
+        /* table.get, table.set, memory.size, data.drop, elem.drop,
+         * table.grow and table.size: one helper call each, through the
+         * memory helper, which leaves imported storage, invalid references
+         * and out-of-range indexes to a pre-effect exit. */
+        int is_table = instruction.op == 0x25 || instruction.op == 0x26 ||
+            instruction.op == 0xfc0f || instruction.op == 0xfc10;
+        GRJIT_Type address_type = GRJIT_TYPE_I32;
+        if (is_table) {
+          /* table.size reads no reference, so any table's size compiles. */
+          if (instruction.a >= module->ntables ||
+              (instruction.op != 0xfc10 &&
+               (module->tables[instruction.a].elem.kind != GLWASM_VK_REF ||
+                (module->tables[instruction.a].elem.heap != GLWASM_HT_FUNC &&
+                 module->tables[instruction.a].elem.heap !=
+                     GLWASM_HT_NOFUNC)))) {
+            side_exit = 1; break;
+          }
+          if (module->tables[instruction.a].addr64)
+            address_type = GRJIT_TYPE_I64;
+        } else if (instruction.op == 0x3f) {
+          if (instruction.a >= module->nmems) { side_exit = 1; break; }
+          if (module->mems[instruction.a].addr64)
+            address_type = GRJIT_TYPE_I64;
+        }
+        /* Operands, top last: table.get index; table.set index, value;
+         * table.grow value, delta. */
+        uint32_t pops = instruction.op == 0x25 ? 1u
+            : instruction.op == 0x26 || instruction.op == 0xfc0f ? 2u : 0u;
+        if (stack_count < pops) { side_exit = 1; break; }
+        size_t arg_base = stack_count - pops;
+        GRJIT_VReg address_reg = 0, value_reg = 0;
+        int have_address = 0, have_value = 0;
+        if (instruction.op == 0x25 || instruction.op == 0x26) {
+          if (stack[arg_base].type != address_type ||
+              (instruction.op == 0x26 &&
+               stack[arg_base + 1u].type != GRJIT_TYPE_I64)) {
+            side_exit = 1; break;
+          }
+          address_reg = stack[arg_base].reg;
+          have_address = 1;
+          if (instruction.op == 0x26) {
+            value_reg = stack[arg_base + 1u].reg;
+            have_value = 1;
+          }
+        } else if (instruction.op == 0xfc0f) {
+          if (stack[arg_base].type != GRJIT_TYPE_I64 ||
+              stack[arg_base + 1u].type != address_type) {
+            side_exit = 1; break;
+          }
+          value_reg = stack[arg_base].reg;
+          address_reg = stack[arg_base + 1u].reg;
+          have_address = have_value = 1;
+        }
+        if (have_address && address_type == GRJIT_TYPE_I32) {
+          GRJIT_VReg widened;
+          jr = grjit_builder_vreg(builder, GRJIT_TYPE_I64, &widened);
+          if (jr == GRJIT_OK)
+            jr = grjit_builder_unary(builder, GRJIT_OP_EXTEND_U, widened,
+                grjit_operand_vreg(address_reg));
+          address_reg = widened;
+        }
+        GRJIT_Operand args[5] = {grjit_operand_vreg(instance),
+            grjit_operand_imm(function_index), grjit_operand_imm(pc),
+            have_address ? grjit_operand_vreg(address_reg)
+                : grjit_operand_imm(0),
+            have_value ? grjit_operand_vreg(value_reg) : grjit_operand_imm(0)};
+        GRJIT_VReg helper_result, succeeded;
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_vreg(builder, GRJIT_TYPE_I64, &helper_result);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_call(builder, helper_result,
+              (uint64_t)memory_helper, GRJIT_CALL_GC_POINT,
+              GRCORE_SITE_GC_POINT_CALL, args, 5, identity, state,
+              slot_count);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_vreg(builder, GRJIT_TYPE_I32, &succeeded);
+        if (jr == GRJIT_OK) {
+          GRJIT_Operand status_args[1] = {grjit_operand_vreg(instance)};
+          jr = grjit_builder_call(builder, succeeded,
+              (uint64_t)helper_status_helper, GRJIT_CALL_NO_GC,
+              GRCORE_SITE_GC_POINT_CALL, status_args, 1, identity, NULL, 0);
+        }
+        GRJIT_BlockId success_block, fallback_block;
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_block(builder, &success_block);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_block(builder, &fallback_block);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_br_if(builder, grjit_operand_vreg(succeeded),
+              success_block, fallback_block);
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_set_block(builder, fallback_block);
+        if (jr == GRJIT_OK)
+          result = emit_named_exit(builder, function_index,
+              instruction.op, named_exit_helper, instance, identity, state,
+              slot_count, signature);
+        if (jr == GRJIT_OK && result != GLWASM_OK) jr = GRJIT_ERR_INTERNAL;
+        if (jr == GRJIT_OK)
+          jr = grjit_builder_set_block(builder, success_block);
+        stack_count = arg_base;
+        if (jr == GRJIT_OK && instruction.op != 0x26 &&
+            instruction.op != 0xfc09 && instruction.op != 0xfc0d) {
+          GRJIT_Type result_type = instruction.op == 0x25 ? GRJIT_TYPE_I64
+              : address_type;
+          GRJIT_VReg pushed = helper_result;
+          if (result_type == GRJIT_TYPE_I32) {
+            jr = grjit_builder_vreg(builder, GRJIT_TYPE_I32, &pushed);
+            if (jr == GRJIT_OK)
+              jr = grjit_builder_unary(builder, GRJIT_OP_WRAP, pushed,
+                  grjit_operand_vreg(helper_result));
+          }
+          if (jr == GRJIT_OK && stack_count >= max_stack) {
+            result = GLWASM_ERR_INTERNAL;
+            if (failure_site) *failure_site = __LINE__;
+            goto done;
+          }
+          stack[stack_count++] = (GLWASM_JitValue){pushed, result_type};
+        }
+        if (jr != GRJIT_OK) {
+          result = map_jit_result_capture(jr, failure_jit_result);
+          if (failure_site) *failure_site = __LINE__;
+          goto done;
+        }
         break;
       }
       case 0x0b: { /* final function end */
@@ -2486,24 +2703,27 @@ GLWASM_Result glwasm_jit_lower_function(GLWASM_Module *module,
               call_result_types[ri]};
         break;
       }
-      case 0xfc0a: case 0xfc0b: { /* memory.copy / memory.fill */
+      case 0xfc08: case 0xfc0a: case 0xfc0b: {
+        /* memory.init / memory.copy / memory.fill */
         uint32_t sub = instruction.op & 0xffu;
-        uint32_t dst_memory = instruction.a;
+        uint32_t dst_memory = sub == 8u ? instruction.b : instruction.a;
         uint32_t src_memory = instruction.b;
         if (stack_count < 3u || dst_memory >= module->nmems ||
+            (sub == 8u && instruction.a >= module->ndatas) ||
             (sub == 10u && src_memory >= module->nmems)) {
           side_exit = 1; break;
         }
         int addr64 = module->mems[dst_memory].addr64 != 0;
+        GRJIT_Type address_type = addr64 ? GRJIT_TYPE_I64 : GRJIT_TYPE_I32;
+        /* memory.init's segment offset and length are i32 for every
+         * memory. */
         if ((sub == 10u &&
              addr64 != (module->mems[src_memory].addr64 != 0)) ||
-            stack[stack_count - 3u].type !=
-                (addr64 ? GRJIT_TYPE_I64 : GRJIT_TYPE_I32) ||
-            (sub == 10u && stack[stack_count - 2u].type !=
-                (addr64 ? GRJIT_TYPE_I64 : GRJIT_TYPE_I32)) ||
-            (sub == 11u && stack[stack_count - 2u].type != GRJIT_TYPE_I32) ||
+            stack[stack_count - 3u].type != address_type ||
+            (sub == 10u && stack[stack_count - 2u].type != address_type) ||
+            (sub != 10u && stack[stack_count - 2u].type != GRJIT_TYPE_I32) ||
             stack[stack_count - 1u].type !=
-                (addr64 ? GRJIT_TYPE_I64 : GRJIT_TYPE_I32)) {
+                (sub == 8u ? GRJIT_TYPE_I32 : address_type)) {
           side_exit = 1; break;
         }
         size_t arg_base = stack_count - 3u;
@@ -2592,14 +2812,19 @@ GLWASM_Result glwasm_jit_lower_function(GLWASM_Module *module,
         stack_count = arg_base;
         break;
       }
-      case 0xfc0e: case 0xfc11: { /* table.copy / table.fill */
+      case 0xfc0c: case 0xfc0e: case 0xfc11: {
+        /* table.init / table.copy / table.fill */
         uint32_t sub = instruction.op & 0xffu;
-        uint32_t dst_table = instruction.a;
+        uint32_t dst_table = sub == 12u ? instruction.b : instruction.a;
         uint32_t src_table = instruction.b;
         if (stack_count < 3u || dst_table >= module->ntables ||
+            (sub == 12u && instruction.a >= module->nelems) ||
             (sub == 14u && src_table >= module->ntables) ||
             module->tables[dst_table].elem.kind != GLWASM_VK_REF ||
-            (module->tables[dst_table].elem.heap != GLWASM_HT_FUNC &&
+            /* Init and copy move tokens inside the helper; only fill takes
+             * a reference from compiled code. */
+            (sub == 17u &&
+             module->tables[dst_table].elem.heap != GLWASM_HT_FUNC &&
              module->tables[dst_table].elem.heap != GLWASM_HT_NOFUNC) ||
             (sub == 14u && !wasm_jit_same_type(
                 module->tables[dst_table].elem,
@@ -2609,6 +2834,8 @@ GLWASM_Result glwasm_jit_lower_function(GLWASM_Module *module,
         size_t arg_base = stack_count - 3u;
         if ((stack[arg_base].type != GRJIT_TYPE_I32 &&
              stack[arg_base].type != GRJIT_TYPE_I64) ||
+            (sub == 12u && (stack[arg_base + 1u].type != GRJIT_TYPE_I32 ||
+                stack[arg_base + 2u].type != GRJIT_TYPE_I32)) ||
             (sub == 14u && stack[arg_base + 1u].type !=
                 stack[arg_base].type) ||
             (sub == 17u && stack[arg_base + 1u].type != GRJIT_TYPE_I64) ||
@@ -2657,8 +2884,14 @@ GLWASM_Result glwasm_jit_lower_function(GLWASM_Module *module,
         break;
     }
     if (side_exit) {
-      result = emit_named_exit(builder, function_index, instruction.op,
-          named_exit_helper, instance, identity, state, slot_count, signature);
+      /* `unreachable` always traps; the interpreter raises it. */
+      result = instruction.op == 0x00
+          ? emit_trap_exit(builder, function_index, instruction.op,
+              trap_exit_helper, instance, identity, state, slot_count,
+              signature)
+          : emit_named_exit(builder, function_index, instruction.op,
+              named_exit_helper, instance, identity, state, slot_count,
+              signature);
       if (result != GLWASM_OK) {
         if (failure_site) *failure_site = __LINE__;
         goto done;

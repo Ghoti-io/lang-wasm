@@ -155,11 +155,14 @@ GLWASM_Module *module() {
 
 GLWASM_Runtime *runtime(Fixture *fixture, GLWASM_Module *m) {
   GLWASM_HostImport import{};
+  static const GLWASM_HostValueType result_i32[] = {GLWASM_HOST_I32};
   import.module = "tang.v1";
   import.field = "op";
   import.function = initial;
   import.resume = resume;
   import.user = fixture;
+  import.results = result_i32;
+  import.result_count = 1;
   GLWASM_Runtime *r = nullptr;
   if (glwasm_runtime_create_with_imports(m, &import, 1, 0, nullptr, &r) !=
       GLWASM_OK)
@@ -374,6 +377,20 @@ GRCORE_Step nested_boundary_driver(GRCORE_Context *,void *opaque) {
 }
 }  // namespace
 
+
+/* An adopted context as an embedder makes one: with a native stack budget,
+ * which compiled Wasm needs before it runs at all. */
+static GRCORE_Result budgeted_context(GRCORE_Group *group,
+    GRCORE_Context **out) {
+  GRCORE_Options *options = nullptr;
+  GRCORE_Result result = grcore_options_create(nullptr, &options);
+  if (result == GRCORE_OK)
+    result = grcore_options_set_native_stack_bytes(options, UINT64_C(1) << 20);
+  if (result == GRCORE_OK) result = grcore_context_create(group, options, out);
+  if (options) grcore_options_destroy(options);
+  return result;
+}
+
 TEST(WasmBoundary, RealModuleResumesOnceAndKeepsInstanceAndExceptionIdentity) {
   GLWASM_Module *m = module();
   ASSERT_NE(m, nullptr);
@@ -442,7 +459,7 @@ TEST(WasmBoundary, NestedInvocationPauseResumesAndLimitUnwindStaysLimit) {
   ASSERT_EQ(glwasm_runtime_create(m,&wasm),GLWASM_OK);
   GRCORE_Group *group=nullptr;GRCORE_Context *context=nullptr;
   ASSERT_EQ(grcore_group_create(nullptr,nullptr,&group),GRCORE_OK);
-  ASSERT_EQ(grcore_context_create(group,nullptr,&context),GRCORE_OK);
+  ASSERT_EQ(budgeted_context(group,&context),GRCORE_OK);
   GRCORE_EngineId caller=0;
   ASSERT_EQ(grcore_engine_register(context,&fixture_engine,&caller),GRCORE_OK);
   GRCORE_Port *port=nullptr;
@@ -475,6 +492,7 @@ TEST(WasmBoundary, NestedInvocationPauseResumesAndLimitUnwindStaysLimit) {
   GRCORE_Options *options=nullptr;context=nullptr;group=nullptr;
   ASSERT_EQ(grcore_group_create(nullptr,nullptr,&group),GRCORE_OK);
   ASSERT_EQ(grcore_options_create(nullptr,&options),GRCORE_OK);
+  ASSERT_EQ(grcore_options_set_native_stack_bytes(options,UINT64_C(1)<<20),GRCORE_OK);
   ASSERT_EQ(grcore_context_create(group,options,&context),GRCORE_OK);
   ASSERT_EQ(grcore_engine_register(context,&fixture_engine,&caller),GRCORE_OK);
   GRCORE_EngineId nested_engine=0;
@@ -515,7 +533,7 @@ TEST(WasmBoundary, NestedPauseAndLimitPropagateThroughTheOuterCoreRun) {
 
   GRCORE_Group *group=nullptr;GRCORE_Context *context=nullptr;
   ASSERT_EQ(grcore_group_create(nullptr,nullptr,&group),GRCORE_OK);
-  ASSERT_EQ(grcore_context_create(group,nullptr,&context),GRCORE_OK);
+  ASSERT_EQ(budgeted_context(group,&context),GRCORE_OK);
   state.context=context;state.instance=0x2345;
   ASSERT_EQ(grcore_engine_register(context,&tang_descriptor,&state.caller),GRCORE_OK);
   GRCORE_EngineId wasm_engine=0;
@@ -545,7 +563,7 @@ TEST(WasmBoundary, NestedPauseAndLimitPropagateThroughTheOuterCoreRun) {
 
   group=nullptr;context=nullptr;
   ASSERT_EQ(grcore_group_create(nullptr,nullptr,&group),GRCORE_OK);
-  ASSERT_EQ(grcore_context_create(group,nullptr,&context),GRCORE_OK);
+  ASSERT_EQ(budgeted_context(group,&context),GRCORE_OK);
   state.context=context;state.caller=0;state.instance=0x2346;
   state.pending=false;state.value=0;state.result=GLWASM_ERR_INTERNAL;
   state.control=GRCORE_REQUEST_TERMINATE;state.control_calls=0;
@@ -589,19 +607,22 @@ TEST(WasmBoundary, CompiledTangDescriptorDispatchesIntoWasmOnSharedContext) {
       &policy,nullptr,nullptr,&m),GLWASM_OK);
   TangDispatchFixture state;
   state.table_provider={handle_table_begin,handle_table_end,handle_table_grow,
-      GLWASM_HOST_EXTERNREF,handle_table_validate,&state.table};
+      GLWASM_HOST_EXTERNREF,handle_table_validate,&state.table,0,0,0};
   GLWASM_HostImport imports[2]{};
   imports[0].module="host.v1";imports[0].field="tab";
   imports[0].kind=GLWASM_HOST_IMPORT_TABLE;
   imports[0].resource.table=&state.table_provider;
   imports[1].module="tang.v1";imports[1].field="probe";
   imports[1].function=boundary_probe;imports[1].user=&state;
+  static const GLWASM_HostValueType externref[]={GLWASM_HOST_EXTERNREF};
+  imports[1].parameters=externref;imports[1].parameter_count=1;
+  imports[1].results=externref;imports[1].result_count=1;
   ASSERT_EQ(glwasm_runtime_create_with_imports(m,imports,2,0,nullptr,
       &state.wasm),GLWASM_OK);
 
   GRCORE_Group *group=nullptr;GRCORE_Context *context=nullptr;
   ASSERT_EQ(grcore_group_create(nullptr,nullptr,&group),GRCORE_OK);
-  ASSERT_EQ(grcore_context_create(group,nullptr,&context),GRCORE_OK);
+  ASSERT_EQ(budgeted_context(group,&context),GRCORE_OK);
   state.context=context;
   GRHEAP_Options *heap_options=nullptr;
   ASSERT_EQ(grheap_options_create(nullptr,&heap_options),GRHEAP_OK);
@@ -821,20 +842,22 @@ TEST(WasmBoundary, CompiledTangDescriptorDispatchesIntoWasmOnSharedContext) {
   second.table.elements[0]=55;
   second.table_provider={handle_table_begin,handle_table_end,
       handle_table_grow,GLWASM_HOST_EXTERNREF,handle_table_validate,
-      &second.table};
+      &second.table,0,0,0};
   GLWASM_HostImport second_imports[2]{};
   second_imports[0].module="host.v1";second_imports[0].field="tab";
   second_imports[0].kind=GLWASM_HOST_IMPORT_TABLE;
   second_imports[0].resource.table=&second.table_provider;
   second_imports[1].module="tang.v1";second_imports[1].field="probe";
   second_imports[1].function=boundary_probe;second_imports[1].user=&second;
+  second_imports[1].parameters=externref;second_imports[1].parameter_count=1;
+  second_imports[1].results=externref;second_imports[1].result_count=1;
   ASSERT_EQ(glwasm_runtime_create_with_imports(m,second_imports,2,0,nullptr,
       &second.wasm),GLWASM_OK);
   ASSERT_EQ(glwasm_runtime_test_set_jit_mode(second.wasm,
       GLWASM_TEST_JIT_INTERPRETER),GLWASM_OK);
   GRCORE_Group *second_group=nullptr;GRCORE_Context *second_context=nullptr;
   ASSERT_EQ(grcore_group_create(nullptr,nullptr,&second_group),GRCORE_OK);
-  ASSERT_EQ(grcore_context_create(second_group,nullptr,&second_context),
+  ASSERT_EQ(budgeted_context(second_group,&second_context),
       GRCORE_OK);
   second.context=second_context;
   ASSERT_EQ(grcore_engine_register(second_context,&tang_descriptor,
@@ -980,7 +1003,7 @@ TEST(WasmBoundary, WasmExceptionIdentityReturnsAcrossTheForeignBoundary) {
   ASSERT_EQ(glwasm_runtime_create(module,&wasm),GLWASM_OK);
   GRCORE_Group *group=nullptr;GRCORE_Context *context=nullptr;
   ASSERT_EQ(grcore_group_create(nullptr,nullptr,&group),GRCORE_OK);
-  ASSERT_EQ(grcore_context_create(group,nullptr,&context),GRCORE_OK);
+  ASSERT_EQ(budgeted_context(group,&context),GRCORE_OK);
   GRCORE_EngineId tang=0;
   ASSERT_EQ(grcore_engine_register(context,&tang_descriptor,&tang),GRCORE_OK);
 
@@ -1042,7 +1065,7 @@ TEST(WasmBoundary, SharedCompiledModuleRemainsRegisteredUntilLastRuntimeUnbinds)
   GRCORE_Group *group = nullptr;
   GRCORE_Context *context = nullptr;
   ASSERT_EQ(grcore_group_create(nullptr, nullptr, &group), GRCORE_OK);
-  ASSERT_EQ(grcore_context_create(group, nullptr, &context), GRCORE_OK);
+  ASSERT_EQ(budgeted_context(group,&context), GRCORE_OK);
   GRCORE_EngineId caller = 0;
   ASSERT_EQ(grcore_engine_register(context, &tang_descriptor, &caller),
       GRCORE_OK);

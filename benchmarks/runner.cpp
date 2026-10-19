@@ -198,6 +198,9 @@ void make_instance(Instance &i, const std::vector<uint8_t> &binary,
   if (workload == "mixed-boundary") {
     import.module = "bench.v1"; import.field = "boundary";
     import.function = boundary_call; import.user = &i.boundary;
+    static const GLWASM_HostValueType i32[] = {GLWASM_HOST_I32};
+    import.parameters = i32; import.parameter_count = 1;
+    import.results = i32; import.result_count = 1;
     imports = &import; import_count = 1;
   }
   require(glwasm_runtime_create_with_imports(i.module, imports, import_count, 0,

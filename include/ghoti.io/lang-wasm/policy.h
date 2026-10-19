@@ -37,6 +37,12 @@ typedef struct GLWASM_Policy {
   uint64_t default_fuel; /**< Initial instruction fuel for each instance. */
   uint64_t default_guest_depth; /**< Maximum guest call depth. */
   uint64_t default_native_depth; /**< Maximum nested native call depth. */
+  /** Bytes of native stack compiled code may use below the run's entry.
+   * Compiled recursion that would pass it leaves to the interpreter at the
+   * call, where the guest depth limit then applies. UINT64_MAX is no
+   * budget, and then nothing runs compiled: there is nothing to bound
+   * compiled recursion with. Presets use 1 MiB. */
+  uint64_t default_native_stack_bytes;
   uint64_t default_memory_bytes; /**< Default runtime-core memory budget. */
   /** Privileged Tang boundary imports require both this capability and an
    * exact versioned host binding. Presets leave it disabled. */

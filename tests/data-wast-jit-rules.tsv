@@ -1,0 +1,14 @@
+# Every way the JIT tier may decline to run Wasm code compiled, by opcode.
+# kind<TAB>opcode (hex)<TAB>rule
+# kind is `refusal` (the function is not compiled because it contains the
+# opcode; ffff is a refusal of the whole function), `exit` (compiled code
+# leaves to the interpreter at the opcode), or `retirement` (opcode `-`: a
+# function retired by its exit rate; each exit behind it has its own row).
+# The spec-suite gate fails on any refusal or exit that has no row here, and
+# each rule is documented in documentation/design.md.
+exit	10	call to another instance, or at the native stack budget
+exit	11	call_indirect to another instance or the host, or at the native stack budget
+exit	12	return_call to an imported function
+exit	d0	ref.null of externref or a typed reference
+refusal	ffff	signature or local of externref or a typed reference, or over 16 values
+retirement	-	retired by exit rate after named exits

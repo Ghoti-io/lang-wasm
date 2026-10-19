@@ -72,6 +72,7 @@ GLWASM_Result glwasm_policy_preset(GLWASM_PolicyPreset preset,
   out->default_fuel = UINT64_C(10000000);
   out->default_guest_depth = 256;
   out->default_native_depth = 64;
+  out->default_native_stack_bytes = UINT64_C(1) << 20;
   out->default_memory_bytes = out->limits.memory_maximum;
   out->max_jit_code_bytes = UINT64_C(16) * 1024 * 1024;
   out->jit_disabled_cpu_features = GRJIT_FEATURES_ALL;

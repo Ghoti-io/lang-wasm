@@ -181,33 +181,20 @@ bytes and children through the caller's allocator (or the default allocator),
 and carries a byte offset plus one-based line and column. Nested `(; ;)`
 comments, line comments, lists, atoms and quoted byte strings are recognized,
 including byte and Unicode escapes. `script.h` classifies top-level WAST
-commands into typed command kinds and retains the original syntax node for a
-future executor. Source must be valid UTF-8, byte escapes retain arbitrary
+commands into typed command kinds and retains the original syntax node for
+the spec-suite runner. Source must be valid UTF-8, byte escapes retain arbitrary
 string bytes, and nesting deeper than 256 levels is rejected to bound stack
 use. Command envelopes validate actions, constant arguments and assertion
 values while leaving execution to the runtime adapter. `glwasm_wat_module_parse`
-lowers a currently narrow function
-subset (function imports, numeric params/results including multi-value results,
-explicit named/numeric function types and type uses, exports, folded numeric
-operations, linear integer/floating constants, selected scalar numeric
-operators,
-numeric and named locals, function/table/memory/global imports, start functions, direct
-and indirect calls, reference null/function instructions, table get/set, numeric
-branch tables, basic block/loop/if control, defined tables/memories including
-memory64/table64 declarations,
-function-index and expression-form element segments, active/passive data
-segments, selected bulk memory/table instructions, multi-memory scalar accesses,
-and constant numeric globals) to canonical
-binary sections, then reuses the decoder and validator. The lowering rejects
-unsupported module fields and instructions explicitly. It does not yet cover
-the in-scope WAT grammar; generated-binary validation errors currently point
-to the module form, while syntax/lowering errors point to their source form.
-Supported return, trap, and guest-exception assertions execute through the
-runtime interpreter adapter; unsupported value forms remain pending explicitly.
+lowers a module form to canonical binary sections, then reuses the decoder and
+validator, so text and binary modules meet one set of checks. The lowering
+covers the in-scope grammar the pinned corpus uses (the spec-suite gate lowers
+every in-scope module of it) and rejects unsupported fields and instructions
+explicitly. Generated-binary validation errors point to the module form;
+syntax and lowering errors point to their source form.
 Story 5 adds interpreter dispatch for `throw`, `throw_ref`, and `try_table`,
 including tag identity, payload/ref transfer, nested propagation, and limit
-bypass. The pinned execution baseline records these assertions; compiled-tier
-exception execution remains gated by Story 10.
+bypass. The spec-suite gate below runs those assertions in both tiers.
 
 ## Pinned WAST corpus gate
 
@@ -223,9 +210,28 @@ module commands or assertions are listed in
 `tests/data-wast-assertion-skips.tsv` and are counted by reason.
 `make test` checks the exact fetched file set, all digests and the exhaustive
 classification before it parses the corpus through the public WAST command
-parser. Supported execution assertions are counted only after the runtime
-adapter executes them; unsupported later-story instructions remain explicitly
-pending.
+parser. `testSpec_suite` then runs every in-scope command of every `run` file
+in both tiers, each script in one store with `spectest` registered first, and
+fails on any command that does not pass, so nothing in scope is pending.
+
+The JIT tier is audited per instance as it runs. Every compile refusal and
+every opcode exit must match a row of `tests/data-wast-jit-rules.tsv`; a JIT
+tier that silently interpreted would otherwise pass the same commands. The
+rules, and why each remains:
+
+- **Calls that leave the instance** (`call`, `call_indirect`, `return_call`).
+  Compiled code serves every instance of its module, so a callee in another
+  instance, an imported callee of `return_call`, or a call at the native
+  stack budget is made by the interpreter, which owns cross-instance frames
+  and continues a deep recursion on its own stack.
+- **Externref and typed references** (`ref.null` of those types, and a
+  whole-function refusal, opcode `ffff`, for a signature or local of those
+  types or over 16 parameters or results). Externref tokens may be host-heap
+  handles, so compiling them needs a reference representation in the
+  compiled frame state; that is deferred work, not a decision.
+- **Retirement by exit rate.** A function whose recent entries keep exiting
+  is retired to the interpreter. It is allowed only because each exit behind
+  it is checked against its own row.
 
 ## Translation and source locations
 
@@ -454,16 +460,28 @@ direct host call. Externref and typed-reference signatures keep the exact
 pre-effect interpreter exit.
 
 The baseline lowerer also treats nullable `funcref` values as stable
-module-local integer tokens. `ref.null`, `ref.func`, and `ref.is_null` therefore
+store-address tokens. `ref.null`, `ref.func`, and `ref.is_null` therefore
 stay compiled without exposing moving heap objects to generated code; externref
-and typed references still exit before their instruction. Bounded
-`memory.copy`/`memory.fill` and `table.copy`/`table.fill` use GC-point helpers
-only when the operation fits one interpreter chunk (4096 bytes or 1024
-elements). Helpers acquire current storage, validate all ranges and fill
-tokens before mutation, and release leases before compiled code continues.
-Larger operations, imported storage, and invalid ranges take an opcode-counted
-pre-effect exit so the interpreter owns incremental polling, resource
-callbacks, and the exact trap.
+and typed references still exit before their instruction. Table and memory
+operations that touch no reference held in compiled code run through
+GC-point helpers that the interpreter's own primitives back: `table.get`,
+`table.set`, `table.grow`, `table.size`, `memory.size`, `data.drop`,
+`elem.drop`, `memory.init`/`memory.copy`/`memory.fill` (one 4096-byte chunk
+per call, with a poll between chunks) and `table.init`/`table.copy`/
+`table.fill` (one call of at most 1024 elements). Helpers validate every
+range and reference before mutation and report a trap without an effect;
+the interpreter then raises it from the pre-effect state. Imported storage,
+whose begin/end callbacks belong to the embedder, a table operation over 1024
+elements, and a reference the helper cannot vouch for take an opcode-counted
+pre-effect exit instead.
+
+Trapping truncations (`i32.trunc_f32_s` and the other seven) compile as a
+range check and the saturating conversion, which agree on every input inside
+the range. Each range is open or half-open on bounds exact in both float
+widths, and ordered comparisons reject NaN, so NaN and the first input past
+either bound take the trap exit. `unreachable` takes it unconditionally.
+Trap exits are not opcode exits: they describe guest semantics, so they
+count toward neither the spec-suite rules nor retirement.
 
 Numeric and nullable-funcref global reads and writes also remain compiled.
 Generated code calls helpers with the active runtime instance and a global

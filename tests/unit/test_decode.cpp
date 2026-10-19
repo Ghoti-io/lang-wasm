@@ -700,6 +700,7 @@ TEST(Decode, RuntimePropagatesMultiResultCalleeAndClearsOutputOnFailure) {
   EXPECT_EQ(runtime, nullptr);
 }
 
+/* An import with no binding does not link, whatever its kind. */
 TEST(Decode, RuntimeRejectsUnboundImportedGlobals) {
   static const char wat[] =
       "(module (import \"other\" \"global_i32\" (global i32)) "
@@ -710,7 +711,7 @@ TEST(Decode, RuntimeRejectsUnboundImportedGlobals) {
       sizeof(wat)-1, nullptr, nullptr, &error, &module), GLWASM_OK)
       << (error.message ? error.message : "");
   GLWASM_Runtime *runtime = nullptr;
-  EXPECT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_ERR_UNSUPPORTED);
+  EXPECT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_ERR_LINK);
   EXPECT_EQ(runtime, nullptr);
   glwasm_module_destroy(module);
 }

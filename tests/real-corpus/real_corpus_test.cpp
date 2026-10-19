@@ -323,11 +323,39 @@ GLWASM_Result reject_unexpected_wasi_call(const GLWASM_HostCall *,
   return GLWASM_ERR_UNSUPPORTED;
 }
 
+/* The reviewed WASI preview 1 signatures the Lua workload imports; the
+ * binding declares each, and the engine checks it against the module. */
 GLWASM_HostImport make_wasi_test_import(const char *field) {
+  static const GLWASM_HostValueType i32 = GLWASM_HOST_I32;
+  static const GLWASM_HostValueType clock[] = {GLWASM_HOST_I32,
+      GLWASM_HOST_I64, GLWASM_HOST_I32};
+  static const GLWASM_HostValueType one[] = {GLWASM_HOST_I32};
+  static const GLWASM_HostValueType two[] = {GLWASM_HOST_I32, GLWASM_HOST_I32};
+  static const GLWASM_HostValueType three[] = {GLWASM_HOST_I32,
+      GLWASM_HOST_I32, GLWASM_HOST_I32};
+  static const GLWASM_HostValueType seek[] = {GLWASM_HOST_I32,
+      GLWASM_HOST_I64, GLWASM_HOST_I32, GLWASM_HOST_I32};
+  static const GLWASM_HostValueType write[] = {GLWASM_HOST_I32,
+      GLWASM_HOST_I32, GLWASM_HOST_I32, GLWASM_HOST_I32};
+  struct Signature { const char *field; const GLWASM_HostValueType *params;
+                     uint32_t nparams; uint32_t nresults; };
+  static const Signature signatures[] = {
+      {"clock_time_get", clock, 3, 1}, {"fd_close", one, 1, 1},
+      {"fd_prestat_get", two, 2, 1}, {"fd_prestat_dir_name", three, 3, 1},
+      {"fd_seek", seek, 4, 1}, {"fd_write", write, 4, 1},
+      {"proc_exit", one, 1, 0}};
   GLWASM_HostImport result{};
   result.module = "wasi_snapshot_preview1";
   result.field = field;
+  result.kind = GLWASM_HOST_IMPORT_FUNCTION;
   result.function_results = reject_unexpected_wasi_call;
+  for (const Signature &signature : signatures)
+    if (std::strcmp(signature.field, field) == 0) {
+      result.parameters = signature.params;
+      result.parameter_count = signature.nparams;
+      result.results = signature.nresults ? &i32 : nullptr;
+      result.result_count = signature.nresults;
+    }
   return result;
 }
 

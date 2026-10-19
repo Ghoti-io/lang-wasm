@@ -1040,7 +1040,7 @@ TEST(WasmDebug, ImportedMemoryInspectionBalancesEveryLease) {
   state.bytes.resize(65536);
   state.bytes[0]=0x78;state.bytes[1]=0x56;state.bytes[2]=0x34;state.bytes[3]=0x12;
   GLWASM_HostMemoryProvider provider{debug_memory_begin,debug_memory_end,
-      debug_memory_grow,&state};
+      debug_memory_grow,&state,0,0,0};
   GLWASM_HostImport import{};
   import.module="host.v1";
   import.field="memory";

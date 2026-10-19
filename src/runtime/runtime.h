@@ -14,12 +14,7 @@ typedef enum GLWASM_TestJitMode {
   GLWASM_TEST_JIT_AUTO = 1,
   GLWASM_TEST_JIT_REQUIRE = 2
 } GLWASM_TestJitMode;
-typedef enum { GLWASM_TRAP_NONE=0, GLWASM_TRAP_UNREACHABLE,
-  GLWASM_TRAP_DIVIDE_BY_ZERO, GLWASM_TRAP_INTEGER_OVERFLOW,
-  GLWASM_TRAP_TABLE_OUT_OF_BOUNDS, GLWASM_TRAP_UNINITIALIZED_ELEMENT,
-  GLWASM_TRAP_INDIRECT_CALL_TYPE_MISMATCH,
-  GLWASM_TRAP_MEMORY_OUT_OF_BOUNDS,
-  GLWASM_TRAP_INVALID_REFERENCE } GLWASM_RuntimeTrap;
+/* Trap kinds are public: GLWASM_Trap in host.h. */
 typedef struct GLWASM_TestDeoptOrigin {
   uint64_t cause;
   uint32_t function;
@@ -31,7 +26,7 @@ typedef struct GLWASM_TestDeoptOrigin {
 } GLWASM_TestDeoptOrigin;
 typedef struct GLWASM_TestRuntimeFailureInfo {
   GLWASM_Result run_error;
-  GLWASM_RuntimeTrap trap;
+  GLWASM_Trap trap;
   GRCORE_Result core_result;
   GRCORE_Outcome outcome;
   uint32_t last_function;
@@ -77,7 +72,15 @@ typedef struct GLWASM_TestRuntimeFailureInfo {
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* Test seams: one instance in a store of its own (made from the module's
+ * policy), destroyed together by glwasm_runtime_destroy. An instance made
+ * by glwasm_store_instantiate belongs to its store; destroying it here is
+ * a no-op. */
 GLWASM_Result glwasm_runtime_create(GLWASM_Module *module, GLWASM_Runtime **out);
+GLWASM_Result glwasm_runtime_create_with_imports(GLWASM_Module *module,
+    const GLWASM_HostImport *imports, size_t import_count, int allow_start,
+    GLWASM_LinkError *link_error, GLWASM_Runtime **out);
+
 /* The runtime retains the module until runtime destruction. */
 void glwasm_runtime_destroy(GLWASM_Runtime *runtime);
 /* Arguments and the result use Wasm value bits in zero-extended 64-bit words:
@@ -116,7 +119,7 @@ GLWASM_Result glwasm_runtime_test_reset_observed_functions(
     GLWASM_Runtime *runtime);
 GLWASM_Result glwasm_runtime_set_test_limits(GLWASM_Runtime *runtime,
     uint64_t fuel, uint64_t guest_depth, int always_move_stack);
-GLWASM_RuntimeTrap glwasm_runtime_last_trap(const GLWASM_Runtime *runtime);
+GLWASM_Trap glwasm_runtime_last_trap(const GLWASM_Runtime *runtime);
 uint64_t glwasm_runtime_test_fuel_used(const GLWASM_Runtime *runtime);
 GLWASM_Result glwasm_runtime_test_set_jit_mode(GLWASM_Runtime *runtime,
     GLWASM_TestJitMode mode);

@@ -77,14 +77,13 @@ comparison with a live rooted probe and requires the relocation collector to
 move it and preserve its value. The relocation target requires a
 `RELOCATE=yes` runtime-heap installed in the first `PKG_CONFIG_PATH` prefix.
 
-The WAST gate pins its supported execution count and deferred standalone
-invocation count in `tests/data-wast-execution-baseline.tsv`, keyed to the
-fetched spec commit. A changed count requires updating that baseline and the
-Story 3 review record. Its summary reports executed assertions, assertions
-pending later-story or unsupported behavior, and standalone invocations
-deferred because runtime creation or execution is not supported for that case.
-The baseline covers the executed and deferred-invocation counts; pending
-assertions remain visible as a scope measure and are not counted as passes.
+The spec-suite gate, `testSpec_suite`, runs every in-scope command of the
+pinned corpus in both the interpreter and the JIT tier and fails on any command
+that does not pass; out-of-scope commands are named, with a reason, in
+`tests/data-wast-assertion-skips.tsv`. In the JIT tier it also fails on any
+compile refusal or exit to the interpreter that has no named rule in
+`tests/data-wast-jit-rules.tsv` (`make test-spec-suite` runs it alone). The
+rules are explained in `documentation/design.md`.
 The corpus gate separately reports runtime-unsupported and runtime-init-trap
 outcomes in its diagnostic summaries. Trap assertions match recognized Wasm trap names;
 table bounds also accepts the spec-suite spelling `out of bounds table access`,

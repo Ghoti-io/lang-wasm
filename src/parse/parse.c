@@ -120,7 +120,8 @@ static int skip(Parser * p) {
     while (p->p < p->n && ws(p->s[p->p]))
       advance(p);
     if (p->p + 1 < p->n && p->s[p->p] == ';' && p->s[p->p + 1] == ';') {
-      while (p->p < p->n && p->s[p->p] != '\n')
+      /* A line comment ends at any newline: LF, CR, or CR LF. */
+      while (p->p < p->n && p->s[p->p] != '\n' && p->s[p->p] != '\r')
         advance(p);
       continue;
     }

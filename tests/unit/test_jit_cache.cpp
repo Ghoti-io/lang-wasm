@@ -24,6 +24,8 @@
 #include <string>
 #include <thread>
 
+static const GLWASM_HostValueType kJitHostI32[] = {GLWASM_HOST_I32};
+
 namespace {
 
 void release_payload(void *) {}
@@ -478,7 +480,7 @@ TEST(JitCache, InterpreterImplementsValidatedIntegerAndFloatNumericFamilies) {
   EXPECT_EQ(result, 0u);
   EXPECT_EQ(glwasm_runtime_invoke_export(runtime, "trunc_trap", nullptr, 0,
       &result), GLWASM_ERR_GUEST);
-  EXPECT_EQ(glwasm_runtime_last_trap(runtime), GLWASM_TRAP_INTEGER_OVERFLOW);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime), GLWASM_TRAP_INVALID_CONVERSION);
   EXPECT_EQ(glwasm_runtime_invoke_export(runtime, "div_overflow", nullptr, 0,
       &result), GLWASM_ERR_GUEST);
   EXPECT_EQ(glwasm_runtime_last_trap(runtime), GLWASM_TRAP_INTEGER_OVERFLOW);
@@ -618,6 +620,8 @@ TEST(JitCache, HostBoundarySupportsMultiValueResultSlices) {
   binding.module = "test"; binding.field = "pair";
   binding.kind = GLWASM_HOST_IMPORT_FUNCTION;
   binding.function_results = jit_test_host_multi; binding.user = &calls;
+  static const GLWASM_HostValueType pair[] = {GLWASM_HOST_I32, GLWASM_HOST_I64};
+  binding.results = pair; binding.result_count = 2;
   GLWASM_Runtime *runtime = nullptr;
   ASSERT_EQ(glwasm_runtime_create_with_imports(module, &binding, 1, 0,
       nullptr, &runtime), GLWASM_OK);
@@ -678,7 +682,16 @@ TEST(JitCache, NestedBoundaryReturnsMultiValueSlices) {
   GRCORE_Group *group = nullptr;
   GRCORE_Context *context = nullptr;
   ASSERT_EQ(grcore_group_create(nullptr, nullptr, &group), GRCORE_OK);
-  ASSERT_EQ(grcore_context_create(group, nullptr, &context), GRCORE_OK);
+  {
+    /* An external context as an embedder makes one: with a native stack
+     * budget, without which nothing runs compiled. */
+    GRCORE_Options *options = nullptr;
+    ASSERT_EQ(grcore_options_create(nullptr, &options), GRCORE_OK);
+    ASSERT_EQ(grcore_options_set_native_stack_bytes(options,
+        UINT64_C(1) << 20), GRCORE_OK);
+    ASSERT_EQ(grcore_context_create(group, options, &context), GRCORE_OK);
+    grcore_options_destroy(options);
+  }
   GRCORE_EngineId caller = 0;
   ASSERT_EQ(grcore_engine_register(context, &external_caller, &caller),
       GRCORE_OK);
@@ -1328,6 +1341,7 @@ TEST(JitCache, RequiredTierPauseAcrossTryTableResumesWithoutCatch) {
   binding.function = jit_test_host_pause;
   binding.resume = jit_test_host_resume;
   binding.user = &state;
+  binding.results = kJitHostI32; binding.result_count = 1;
   GLWASM_Runtime *runtime = nullptr;
   ASSERT_EQ(glwasm_runtime_create_with_imports(module, &binding, 1, 0,
       nullptr, &runtime), GLWASM_OK);
@@ -1826,7 +1840,7 @@ TEST(JitCache, ExternrefRefusesCompilationWhileExnrefTokenCompiles) {
   glwasm_module_destroy(module);
 }
 
-TEST(JitCache, RequiredTierNamesGlobalTableSizeAndUnreachableExits) {
+TEST(JitCache, RequiredTierCompilesGlobalTableGetMemorySizeAndUnreachable) {
   static const uint8_t source[] = "(module"
       " (global $g (mut i32) (i32.const 9))"
       " (memory 1) (table 1 funcref)"
@@ -1861,11 +1875,21 @@ TEST(JitCache, RequiredTierNamesGlobalTableSizeAndUnreachableExits) {
   ASSERT_EQ(glwasm_runtime_invoke_export(runtime, "table_get", nullptr, 0,
       &result), GLWASM_OK);
   EXPECT_EQ(result, 1u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x00), 1u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x23), 0u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x24), 0u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x25), 1u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x3f), 1u);
+  /* None leaves compiled code but `unreachable`, whose trap the
+   * interpreter raises. */
+  for (uint16_t opcode : {0x00, 0x23, 0x24, 0x25, 0x3f})
+    EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, opcode), 0u)
+        << opcode;
+  GLWASM_JitCacheStats dead{};
+  ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime, 0, &dead), GLWASM_OK);
+  EXPECT_EQ(dead.exit_counts[GLWASM_JIT_EXIT_TRAP_RECONSTRUCTION], 1u);
+  EXPECT_EQ(dead.exit_counts[GLWASM_JIT_EXIT_NAMED_UNSUPPORTED], 0u);
+  for (uint32_t function = 1; function <= 4; ++function) {
+    GLWASM_JitCacheStats stats{};
+    ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime, function, &stats),
+        GLWASM_OK);
+    EXPECT_EQ(stats.guest_visible_exits, 0u) << function;
+  }
   glwasm_runtime_destroy(runtime);
   glwasm_module_destroy(module);
 }
@@ -1917,7 +1941,7 @@ TEST(JitCache, RequiredTierSupportsAllNumericGlobalTypes) {
   glwasm_module_destroy(module);
 }
 
-TEST(JitCache, RequiredTierTableSetExitsBeforeMutationAndResumesExactly) {
+TEST(JitCache, RequiredTierTableSetStoresCompiled) {
   static const uint8_t source[] = "(module"
       " (type $value (func (result i32)))"
       " (table 1 funcref)"
@@ -1940,15 +1964,20 @@ TEST(JitCache, RequiredTierTableSetExitsBeforeMutationAndResumesExactly) {
   ASSERT_EQ(glwasm_runtime_invoke_export(runtime, "read", nullptr, 0,
       &result), GLWASM_OK);
   EXPECT_EQ(result, 37u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x26), 1u);
+  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x26), 0u);
   EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x11), 0u);
+  GLWASM_JitCacheStats set{};
+  ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime, 1, &set), GLWASM_OK);
+  EXPECT_EQ(set.compiled_entries, 1u);
+  EXPECT_EQ(set.guest_visible_exits, 0u);
   glwasm_runtime_destroy(runtime);
   glwasm_module_destroy(module);
 }
 
-TEST(JitCache, RequiredTierMemoryAndTableSegmentOperationsExitBeforeEffect) {
+TEST(JitCache, RequiredTierCompilesMemoryAndTableSegmentOperations) {
   static const uint8_t source[] = "(module"
       " (memory 1) (table 2 funcref)"
+      " (type $none (func))"
       " (data $bytes \"x\")"
       " (func $target)"
       " (elem $items func $target)"
@@ -1960,7 +1989,9 @@ TEST(JitCache, RequiredTierMemoryAndTableSegmentOperationsExitBeforeEffect) {
       " (func (export \"elem_drop\") (elem.drop $items))"
       " (func (export \"table_size\") (result i32) (table.size 0))"
       " (func (export \"table_grow\") (result i32)"
-      "   (table.grow 0 (ref.null func) (i32.const 1))))";
+      "   (table.grow 0 (ref.null func) (i32.const 1)))"
+      " (func (export \"byte\") (result i32) (i32.load8_u (i32.const 0)))"
+      " (func (export \"call\") (call_indirect (type $none) (i32.const 0))))";
   GLWASM_Module *module = nullptr;
   ASSERT_EQ(glwasm_wat_module_parse(source, sizeof(source) - 1, nullptr,
       nullptr, nullptr, &module), GLWASM_OK);
@@ -1969,22 +2000,39 @@ TEST(JitCache, RequiredTierMemoryAndTableSegmentOperationsExitBeforeEffect) {
   ASSERT_EQ(glwasm_runtime_test_set_jit_mode(runtime,
       GLWASM_TEST_JIT_REQUIRE), GLWASM_OK);
   uint64_t result = 0;
-  for (const char *name : {"memory_init", "data_drop", "table_init",
-      "elem_drop"})
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime, "call", nullptr, 0,
+      &result), GLWASM_ERR_GUEST);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime), GLWASM_TRAP_UNINITIALIZED_ELEMENT);
+  for (const char *name : {"memory_init", "table_init"})
     ASSERT_EQ(glwasm_runtime_invoke_export(runtime, name, nullptr, 0,
         &result), GLWASM_OK) << name;
+  ASSERT_EQ(glwasm_runtime_invoke_export(runtime, "byte", nullptr, 0,
+      &result), GLWASM_OK);
+  EXPECT_EQ(result, static_cast<uint64_t>('x'));
+  ASSERT_EQ(glwasm_runtime_invoke_export(runtime, "call", nullptr, 0,
+      &result), GLWASM_OK);
+  for (const char *name : {"data_drop", "elem_drop"})
+    ASSERT_EQ(glwasm_runtime_invoke_export(runtime, name, nullptr, 0,
+        &result), GLWASM_OK) << name;
+  /* A dropped segment has length zero, so a one-element init traps. */
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime, "memory_init", nullptr, 0,
+      &result), GLWASM_ERR_GUEST);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime), GLWASM_TRAP_MEMORY_OUT_OF_BOUNDS);
+  EXPECT_EQ(glwasm_runtime_invoke_export(runtime, "table_init", nullptr, 0,
+      &result), GLWASM_ERR_GUEST);
+  EXPECT_EQ(glwasm_runtime_last_trap(runtime), GLWASM_TRAP_TABLE_OUT_OF_BOUNDS);
   ASSERT_EQ(glwasm_runtime_invoke_export(runtime, "table_size", nullptr, 0,
       &result), GLWASM_OK);
   EXPECT_EQ(result, 2u);
   ASSERT_EQ(glwasm_runtime_invoke_export(runtime, "table_grow", nullptr, 0,
       &result), GLWASM_OK);
   EXPECT_EQ(result, 2u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xfc08), 1u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xfc09), 1u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xfc0c), 1u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xfc0d), 1u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xfc0f), 1u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xfc10), 1u);
+  ASSERT_EQ(glwasm_runtime_invoke_export(runtime, "table_size", nullptr, 0,
+      &result), GLWASM_OK);
+  EXPECT_EQ(result, 3u);
+  for (uint16_t opcode : {0xfc08, 0xfc09, 0xfc0c, 0xfc0d, 0xfc0f, 0xfc10})
+    EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, opcode), 0u)
+        << opcode;
   glwasm_runtime_destroy(runtime);
   glwasm_module_destroy(module);
 }
@@ -1992,8 +2040,9 @@ TEST(JitCache, RequiredTierMemoryAndTableSegmentOperationsExitBeforeEffect) {
 TEST(JitCache, RequiredTierNestedCalleeDeoptResumesBeforeUnsupportedEffect) {
   static const uint8_t source[] = "(module"
       " (func $callee (param i32) (result i32)"
-      " (i32.trunc_f32_s"
-      "  (f32.div (f32.convert_i32_s (local.get 0)) (f32.const 2))))"
+      " (f32.div (f32.convert_i32_s (local.get 0)) (f32.const 2))"
+      " (ref.null extern) (drop)"
+      " (i32.trunc_f32_s))"
       " (func (param i32) (result i32)"
       " (local.get 0) (call $callee))"
       ")";
@@ -2008,7 +2057,8 @@ TEST(JitCache, RequiredTierNestedCalleeDeoptResumesBeforeUnsupportedEffect) {
   uint64_t result = 0;
   ASSERT_EQ(glwasm_runtime_invoke(runtime, 1, argument, 1, &result), GLWASM_OK);
   EXPECT_EQ(result, 21u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xa8), 1u);
+  /* Externref values are not compiled, so ref.null extern always exits. */
+  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xd0), 1u);
   GLWASM_JitCacheStats callee{}, caller{};
   ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime, 0, &callee), GLWASM_OK);
   ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime, 1, &caller), GLWASM_OK);
@@ -2027,7 +2077,7 @@ TEST(JitCache, RecursiveNamedExitIsAttributedOnlyToExecutingFrame) {
       " (func $recur (param i32) (result i32)"
       "  (local.get 0) (i32.eqz)"
       "  (if"
-      "   (then (f32.const 42) (i32.trunc_f32_s) (drop))"
+      "   (then (ref.null extern) (drop))"
       "   (else (local.get 0) (i32.const 1) (i32.sub) (call $recur) (drop)))"
       "  (i32.const 7))"
       ")";
@@ -2045,7 +2095,7 @@ TEST(JitCache, RecursiveNamedExitIsAttributedOnlyToExecutingFrame) {
   EXPECT_EQ(result, 7u);
   GLWASM_JitCacheStats stats{};
   ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime, 0, &stats), GLWASM_OK);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xa8), 1u);
+  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xd0), 1u);
   EXPECT_EQ(stats.exit_counts[GLWASM_JIT_EXIT_NAMED_UNSUPPORTED], 1u);
   EXPECT_GE(stats.exit_counts[GLWASM_JIT_EXIT_GUARD_DEOPT], 1u);
   EXPECT_GT(stats.compiled_entries, 1u);
@@ -2125,6 +2175,7 @@ TEST(JitCache, RequiredTierCompiledImportedBoundaryInvokesHostOnce) {
   binding.field = "value";
   binding.function = jit_test_host_call;
   binding.user = &calls;
+  binding.results = kJitHostI32; binding.result_count = 1;
   GLWASM_Runtime *runtime = nullptr;
   ASSERT_EQ(glwasm_runtime_create_with_imports(module, &binding, 1, 0,
       nullptr, &runtime), GLWASM_OK);
@@ -2156,6 +2207,9 @@ TEST(JitCache, HostI32AndF32ArgumentsIgnoreOldUpperSpillBits) {
   binding.module = "host.v1";
   binding.field = "check";
   binding.function = jit_test_host_narrow_bits;
+  static const GLWASM_HostValueType check[] = {GLWASM_HOST_I32, GLWASM_HOST_F32};
+  binding.parameters = check; binding.parameter_count = 2;
+  binding.results = kJitHostI32; binding.result_count = 1;
   GLWASM_Runtime *interpreter = nullptr, *runtime = nullptr;
   ASSERT_EQ(glwasm_runtime_create_with_imports(module, &binding, 1, 0,
       nullptr, &interpreter), GLWASM_OK);
@@ -2195,6 +2249,7 @@ TEST(JitCache, RequiredTierHostPauseReconstructsCallAndUsesContinuation) {
   binding.function = jit_test_host_pause;
   binding.resume = jit_test_host_resume;
   binding.user = &state;
+  binding.results = kJitHostI32; binding.result_count = 1;
   GLWASM_Runtime *runtime = nullptr;
   ASSERT_EQ(glwasm_runtime_create_with_imports(module, &binding, 1, 0,
       nullptr, &runtime), GLWASM_OK);
@@ -2228,6 +2283,7 @@ TEST(JitCache, RequiredTierHostErrorDoesNotReplayCompletedCallback) {
   binding.field = "value";
   binding.function = jit_test_host_error;
   binding.user = &calls;
+  binding.results = kJitHostI32; binding.result_count = 1;
   GLWASM_Runtime *runtime = nullptr;
   ASSERT_EQ(glwasm_runtime_create_with_imports(module, &binding, 1, 0,
       nullptr, &runtime), GLWASM_OK);
@@ -2626,7 +2682,6 @@ TEST(JitCache, RequiredTierRunsLoopBackedgesWithExactFrameControlState) {
 
 TEST(JitCache, MutableLocalKeepsEarlierStackCopyAcrossLoopAndDeopt) {
   static const uint8_t source[] = "(module"
-      " (table 1 funcref)"
       " (func (param $n i32) (result i32)"
       "  (local $x i32) (local $i i32)"
       "  (local.set $x (i32.const 3))"
@@ -2636,7 +2691,7 @@ TEST(JitCache, MutableLocalKeepsEarlierStackCopyAcrossLoopAndDeopt) {
       "   (local.set $x (i32.add (local.get $x) (i32.const 2)))"
       "   (local.set $i (i32.add (local.get $i) (i32.const 1)))"
       "   (br $again)))"
-      "  (i32.const 0) (ref.null func) (table.set 0)"
+      "  (ref.null extern) (drop)"
       "  (i32.add (local.get $x))))";
   GLWASM_Module *module = nullptr;
   ASSERT_EQ(glwasm_wat_module_parse(source, sizeof(source) - 1, nullptr,
@@ -2656,9 +2711,9 @@ TEST(JitCache, MutableLocalKeepsEarlierStackCopyAcrossLoopAndDeopt) {
   ASSERT_EQ(glwasm_runtime_invoke(runtime, 0, iterations, 1, &actual),
       GLWASM_OK);
   EXPECT_EQ(actual, expected);
-  /* table.set exits after the local changed. Rebuilding requires both its
-   * current value (11) and the older operand copy (3). */
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x26), 1u);
+  /* ref.null extern exits after the local changed. Rebuilding requires both
+   * its current value (11) and the older operand copy (3). */
+  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xd0), 1u);
   GLWASM_JitCacheStats stats{};
   ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime, 0, &stats), GLWASM_OK);
   EXPECT_EQ(stats.compiled_entries, 1u);
@@ -2854,7 +2909,7 @@ TEST(JitCache, RequiredTierSelectMergesCompiledValuesForBothConditions) {
   glwasm_module_destroy(module);
 }
 
-TEST(JitCache, RequiredTierMemoryGrowthAndTableExitPreserveInterpreterEffects) {
+TEST(JitCache, RequiredTierMemoryGrowthAndTableGetMatchInterpreterEffects) {
   static const uint8_t source[] = "(module"
       " (memory 1 2)"
       " (table 1 funcref)"
@@ -2898,13 +2953,14 @@ TEST(JitCache, RequiredTierMemoryGrowthAndTableExitPreserveInterpreterEffects) {
   ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime, 3, &memory), GLWASM_OK);
   ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime, 4, &bad_memory), GLWASM_OK);
   EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x40), 0u);
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x25), 2u);
+  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x25), 0u);
   EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x36), 0u);
   EXPECT_EQ(growth.compiled_entries, 1u);
   EXPECT_EQ(growth.exit_counts[GLWASM_JIT_EXIT_RETURN], 1u);
   EXPECT_EQ(growth.guest_visible_exits, 0u);
   EXPECT_EQ(table.compiled_entries, 2u);
-  EXPECT_EQ(table.exit_counts[GLWASM_JIT_EXIT_NAMED_UNSUPPORTED], 2u);
+  EXPECT_EQ(table.exit_counts[GLWASM_JIT_EXIT_NAMED_UNSUPPORTED], 0u);
+  EXPECT_EQ(table.exit_counts[GLWASM_JIT_EXIT_TRAP_RECONSTRUCTION], 1u);
   EXPECT_EQ(memory.compiled_entries, 1u);
   EXPECT_EQ(memory.guest_visible_exits, 0u);
   EXPECT_EQ(bad_memory.exit_counts[GLWASM_JIT_EXIT_TRAP_RECONSTRUCTION], 1u);
@@ -2949,7 +3005,7 @@ TEST(JitCache, NoMaximumMemoryDeclarationHonorsRuntimeResourceCap) {
 
 TEST(JitCache, DeoptPreservesExactFloatingPointPayloadBits) {
   // Types: (f32) -> f32 and (f64) -> f64. Each wrapper keeps its float below
-  // memory.size's result. JIT lowers memory.size through a named exit, so
+  // a ref.null extern, which compiled code leaves through a named exit, so
   // reconstruction must preserve that raw value.
   static const uint8_t wasm[] = {
       0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
@@ -2959,8 +3015,8 @@ TEST(JitCache, DeoptPreservesExactFloatingPointPayloadBits) {
       0x03,0x03,0x02,0x00,0x01,
       0x05,0x04,0x01,0x01,0x01,0x01,
       0x0a,0x15,0x02,
-        0x09,0x00,0x20,0x00,0x01,0x01,0x3f,0x00,0x1a,0x0b,
-        0x09,0x00,0x20,0x00,0x01,0x01,0x3f,0x00,0x1a,0x0b,
+        0x09,0x00,0x20,0x00,0x01,0x01,0xd0,0x6f,0x1a,0x0b,
+        0x09,0x00,0x20,0x00,0x01,0x01,0xd0,0x6f,0x1a,0x0b,
   };
   GLWASM_Module *module = nullptr;
   ASSERT_EQ(glwasm_module_decode(wasm, sizeof(wasm), nullptr, nullptr, nullptr,
@@ -2998,7 +3054,7 @@ TEST(JitCache, DeoptPreservesExactFloatingPointPayloadBits) {
     EXPECT_EQ(stats.compiled_entries, 1u);
     EXPECT_EQ(stats.exit_counts[GLWASM_JIT_EXIT_NAMED_UNSUPPORTED], 1u);
   }
-  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0x3f), 2u);
+  EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, 0xd0), 2u);
   glwasm_runtime_destroy(runtime);
   glwasm_module_destroy(module);
 }
@@ -3030,29 +3086,63 @@ TEST(JitCache, RequiredTierFloatSignatureExecutesCompiledArithmetic) {
   glwasm_module_destroy(module);
 }
 
-TEST(JitCache, RequiredTierCountsEveryTrappingFloatConversionBeforeExecution) {
+TEST(JitCache, RequiredTierTrappingFloatConversionsMatchAtEveryBound) {
+  /* Each conversion compiles: inputs inside its range convert, and NaN and
+   * the first input past each bound take the trap exit, where the
+   * interpreter raises the precise trap. */
   struct Case {
     const char *op;
     const char *type;
     const char *value;
-    uint16_t opcode;
+    const char *input;
+    uint64_t expected; /* the result, or ~0 for an overflow trap */
   };
+  const uint64_t kTrap = ~UINT64_C(0);
   const Case cases[] = {
-      {"i32.trunc_f32_s", "i32", "f32", 0xa8},
-      {"i32.trunc_f32_u", "i32", "f32", 0xa9},
-      {"i32.trunc_f64_s", "i32", "f64", 0xaa},
-      {"i32.trunc_f64_u", "i32", "f64", 0xab},
-      {"i64.trunc_f32_s", "i64", "f32", 0xae},
-      {"i64.trunc_f32_u", "i64", "f32", 0xaf},
-      {"i64.trunc_f64_s", "i64", "f64", 0xb0},
-      {"i64.trunc_f64_u", "i64", "f64", 0xb1},
+      {"i32.trunc_f32_s", "i32", "f32", "-0x1p31", UINT32_C(0x80000000)},
+      {"i32.trunc_f32_s", "i32", "f32", "0x1.fffffep30", UINT32_C(0x7fffff80)},
+      {"i32.trunc_f32_s", "i32", "f32", "0x1p31", kTrap},
+      {"i32.trunc_f32_s", "i32", "f32", "-0x1.000002p31", kTrap},
+      {"i32.trunc_f32_u", "i32", "f32", "-0x1.fffffep-1", 0},
+      {"i32.trunc_f32_u", "i32", "f32", "0x1.fffffep31", UINT32_C(0xffffff00)},
+      {"i32.trunc_f32_u", "i32", "f32", "-1", kTrap},
+      {"i32.trunc_f32_u", "i32", "f32", "0x1p32", kTrap},
+      {"i32.trunc_f64_s", "i32", "f64", "-2147483648.9", UINT32_C(0x80000000)},
+      {"i32.trunc_f64_s", "i32", "f64", "2147483647.9", UINT32_C(0x7fffffff)},
+      {"i32.trunc_f64_s", "i32", "f64", "-2147483649", kTrap},
+      {"i32.trunc_f64_s", "i32", "f64", "2147483648", kTrap},
+      {"i32.trunc_f64_u", "i32", "f64", "-0.9", 0},
+      {"i32.trunc_f64_u", "i32", "f64", "4294967295.9", UINT32_C(0xffffffff)},
+      {"i32.trunc_f64_u", "i32", "f64", "-1", kTrap},
+      {"i32.trunc_f64_u", "i32", "f64", "4294967296", kTrap},
+      {"i64.trunc_f32_s", "i64", "f32", "-0x1p63", UINT64_C(0x8000000000000000)},
+      {"i64.trunc_f32_s", "i64", "f32", "0x1p63", kTrap},
+      {"i64.trunc_f32_u", "i64", "f32", "0x1.fffffep63",
+          UINT64_C(0xffffff0000000000)},
+      {"i64.trunc_f32_u", "i64", "f32", "0x1p64", kTrap},
+      {"i64.trunc_f64_s", "i64", "f64", "-0x1p63", UINT64_C(0x8000000000000000)},
+      {"i64.trunc_f64_s", "i64", "f64", "0x1.fffffffffffffp62",
+          UINT64_C(0x7ffffffffffffc00)},
+      {"i64.trunc_f64_s", "i64", "f64", "0x1p63", kTrap},
+      {"i64.trunc_f64_u", "i64", "f64", "-0.9", 0},
+      {"i64.trunc_f64_u", "i64", "f64", "0x1p64", kTrap},
   };
+  const char *const nan_ops[][3] = {
+      {"i32.trunc_f32_s", "i32", "f32"}, {"i32.trunc_f32_u", "i32", "f32"},
+      {"i32.trunc_f64_s", "i32", "f64"}, {"i32.trunc_f64_u", "i32", "f64"},
+      {"i64.trunc_f32_s", "i64", "f32"}, {"i64.trunc_f32_u", "i64", "f32"},
+      {"i64.trunc_f64_s", "i64", "f64"}, {"i64.trunc_f64_u", "i64", "f64"},
+  };
+  const size_t ncases = sizeof(cases) / sizeof(cases[0]);
+  const size_t nnan = sizeof(nan_ops) / sizeof(nan_ops[0]);
   std::string source = "(module";
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-    source += " (func (export \"convert" + std::to_string(i) +
-        "\") (result " + cases[i].type + ") (" + cases[i].op +
-        " (" + cases[i].value + ".const nan)))";
-  }
+  for (size_t i = 0; i < ncases; ++i)
+    source += " (func (result " + std::string(cases[i].type) + ") (" +
+        cases[i].op + " (" + cases[i].value + ".const " + cases[i].input +
+        ")))";
+  for (size_t i = 0; i < nnan; ++i)
+    source += " (func (result " + std::string(nan_ops[i][1]) + ") (" +
+        nan_ops[i][0] + " (" + nan_ops[i][2] + ".const nan)))";
   source += ")";
   GLWASM_Module *module = nullptr;
   ASSERT_EQ(glwasm_wat_module_parse(
@@ -3062,21 +3152,33 @@ TEST(JitCache, RequiredTierCountsEveryTrappingFloatConversionBeforeExecution) {
   ASSERT_EQ(glwasm_runtime_create(module, &runtime), GLWASM_OK);
   ASSERT_EQ(glwasm_runtime_test_set_jit_mode(runtime,
       GLWASM_TEST_JIT_REQUIRE), GLWASM_OK);
-  uint64_t result = 0;
-  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-    SCOPED_TRACE(cases[i].op);
-    const std::string name = "convert" + std::to_string(i);
-    EXPECT_EQ(glwasm_runtime_invoke_export(runtime, name.c_str(), nullptr, 0,
-        &result), GLWASM_ERR_GUEST);
-    EXPECT_EQ(glwasm_runtime_last_trap(runtime), GLWASM_TRAP_INTEGER_OVERFLOW);
+  for (size_t i = 0; i < ncases + nnan; ++i) {
+    const bool is_nan = i >= ncases;
+    SCOPED_TRACE(is_nan ? std::string(nan_ops[i - ncases][0]) + " nan"
+        : std::string(cases[i].op) + " " + cases[i].input);
+    uint64_t result = 0;
+    const bool traps = is_nan || cases[i].expected == kTrap;
+    const GLWASM_Result invoked = glwasm_runtime_invoke(runtime,
+        static_cast<uint32_t>(i), nullptr, 0, &result);
+    if (traps) {
+      EXPECT_EQ(invoked, GLWASM_ERR_GUEST);
+      EXPECT_EQ(glwasm_runtime_last_trap(runtime), is_nan
+          ? GLWASM_TRAP_INVALID_CONVERSION : GLWASM_TRAP_INTEGER_OVERFLOW);
+    } else {
+      ASSERT_EQ(invoked, GLWASM_OK);
+      EXPECT_EQ(result, cases[i].expected);
+    }
     GLWASM_JitCacheStats stats{};
     ASSERT_EQ(glwasm_runtime_test_jit_stats(runtime,
         static_cast<uint32_t>(i), &stats), GLWASM_OK);
     EXPECT_EQ(stats.compiled_entries, 1u);
-    EXPECT_EQ(stats.exit_counts[GLWASM_JIT_EXIT_NAMED_UNSUPPORTED], 1u);
-    EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime,
-        cases[i].opcode), 1u);
+    EXPECT_EQ(stats.exit_counts[GLWASM_JIT_EXIT_NAMED_UNSUPPORTED], 0u);
+    EXPECT_EQ(stats.exit_counts[GLWASM_JIT_EXIT_TRAP_RECONSTRUCTION],
+        traps ? 1u : 0u);
   }
+  for (uint16_t opcode : {0xa8, 0xa9, 0xaa, 0xab, 0xae, 0xaf, 0xb0, 0xb1})
+    EXPECT_EQ(glwasm_runtime_test_jit_opcode_exit_count(runtime, opcode), 0u)
+        << opcode;
   glwasm_runtime_destroy(runtime);
   glwasm_module_destroy(module);
 }
@@ -3176,7 +3278,16 @@ TEST(JitCache, RequiredTierRunsInAnExternalNestedContext) {
   GRCORE_Group *group = nullptr;
   GRCORE_Context *context = nullptr;
   ASSERT_EQ(grcore_group_create(nullptr, nullptr, &group), GRCORE_OK);
-  ASSERT_EQ(grcore_context_create(group, nullptr, &context), GRCORE_OK);
+  {
+    /* An external context as an embedder makes one: with a native stack
+     * budget, without which nothing runs compiled. */
+    GRCORE_Options *options = nullptr;
+    ASSERT_EQ(grcore_options_create(nullptr, &options), GRCORE_OK);
+    ASSERT_EQ(grcore_options_set_native_stack_bytes(options,
+        UINT64_C(1) << 20), GRCORE_OK);
+    ASSERT_EQ(grcore_context_create(group, options, &context), GRCORE_OK);
+    grcore_options_destroy(options);
+  }
   GRCORE_EngineId caller = 0;
   ASSERT_EQ(grcore_engine_register(context, &external_caller, &caller),
       GRCORE_OK);
@@ -3374,7 +3485,7 @@ TEST(JitCache, NestedAndTailCallsDriveTheGuestVisibleRetirementWindow) {
       " (memory 1)"
       " (func $callee (param i32) (result i32)"
       "   (local.get 0)"
-      "   (if (then (memory.size) (drop)))"
+      "   (if (then (ref.null extern) (drop)))"
       "   (i32.const 42))"
       " (func (export \"run\") (param i32) (result i32)"
       "   (local.get 0) (call $callee))"
@@ -3402,7 +3513,7 @@ TEST(JitCache, NestedAndTailCallsDriveTheGuestVisibleRetirementWindow) {
   EXPECT_EQ(callee.window_entries,56u);
   EXPECT_EQ(callee.window_exits,0u);
 
-  /* Four direct calls and three tail handoffs take the named memory.size exit.
+  /* Four direct calls and three tail handoffs take the named ref.null exit.
    * The interpreter resumes and completes; both paths attribute the deopt to
    * the callee. */
   for(size_t call=0;call<4;call++) {

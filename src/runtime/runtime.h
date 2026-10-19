@@ -105,6 +105,10 @@ GLWASM_Result glwasm_runtime_resume(GLWASM_Runtime *runtime, uint64_t *result,
 GLWASM_Result glwasm_runtime_resume_results(GLWASM_Runtime *runtime,
     uint64_t *results,uint32_t *result_count,int *paused);
 GLWASM_Result glwasm_runtime_request_test_pause(GLWASM_Runtime *runtime);
+/* Test-only: make exhausted fuel pause, resumably, instead of unwinding,
+ * so a host can stop a run at a fuel count it chose. */
+GLWASM_Result glwasm_store_test_pause_on_fuel(GLWASM_Store *store,
+    int enabled);
 /* Test-only: interrupt at the poll after the named 4096-byte compiled bulk
  * chunk. Zero disarms the one-shot request. */
 GLWASM_Result glwasm_runtime_test_pause_after_bulk_chunks(

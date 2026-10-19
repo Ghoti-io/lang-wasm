@@ -84,6 +84,15 @@ that does not pass; out-of-scope commands are named, with a reason, in
 compile refusal or exit to the interpreter that has no named rule in
 `tests/data-wast-jit-rules.tsv` (`make test-spec-suite` runs it alone). The
 rules are explained in `documentation/design.md`.
+
+The same gate runs the corpus a second time as a frame differential: each
+invocation runs natively on a fuel allowance drawn from its place in the script,
+stops where that runs out, and its whole stack (every frame's identity, locals
+and operands, the globals, and every memory) must match the interpreter's at
+the same instruction. It runs on a torture heap collected at every stop with a
+rooted probe, and a stack that moves at every push; `make test-spec-relocate`
+repeats it with relocation required. The gate fails if too few invocations stop,
+or too few stops are inside compiled code.
 The corpus gate separately reports runtime-unsupported and runtime-init-trap
 outcomes in its diagnostic summaries. Trap assertions match recognized Wasm trap names;
 table bounds also accepts the spec-suite spelling `out of bounds table access`,

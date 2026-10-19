@@ -233,6 +233,27 @@ rules, and why each remains:
   is retired to the interpreter. It is allowed only because each exit behind
   it is checked against its own row.
 
+The second spec-suite test is the corpus frame differential. Each invocation
+gets a fuel allowance drawn log-uniformly up to 2^20 from a seed of the file
+name, so both tiers draw the same sequence; a test seam makes exhausted fuel
+pause rather than unwind, and since both tiers charge one unit per instruction
+and poll at every one, they stop at the same instruction. The stop is recorded
+through the debugger: every frame's identity (with module debug ids replaced by
+order of first appearance, since each tier decodes its own modules), each
+frame's scopes, and a digest of each memory's first MiB with its size. The run
+then resumes unlimited and is checked as usual. Stopping where the fuel runs
+out, not at every instruction, is deliberate: after a stop the rebuilt frame
+finishes interpreted, so stepping would compare the interpreter with itself
+from the first stop on, while one deep stop per invocation compares state that
+compiled code produced. Its floors (stops taken, and stops inside compiled
+code) make it fail rather than pass blind.
+
+It found that a compiled frame's guest frame kept the identity it was pushed
+with: runtime-core's rebuild writes slots, not identities, so a caller waiting
+under a compiled callee, or a frame that left at a named exit, reported its
+function's entry. The deopt hook now sets every rebuilt frame's identity from
+its compiled frame, as lang-tang's does.
+
 ## Translation and source locations
 
 The decoder records the absolute module byte offset before consuming every

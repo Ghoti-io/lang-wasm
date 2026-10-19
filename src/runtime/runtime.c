@@ -582,6 +582,7 @@ struct GLWASM_Store {
   GRCORE_Result last_core_result;
   GRCORE_Outcome last_outcome;
   uint8_t solo;                /* test seam: made by glwasm_runtime_create */
+  uint8_t test_fuel_pauses;    /* test seam: exhausted fuel pauses */
 };
 
 /* Bind the run to the instance whose frame is now on top. */
@@ -750,6 +751,36 @@ static uint32_t wasm_jit_deopt(void *opaque_context, uint64_t cause) {
   size_t rebuilt = 0;
   size_t keep = cause == 2u ? 0u : SIZE_MAX;
   jit_record_active_nested_deopts(runtime, cause);
+  /* The rebuild writes slots, not identities: each compiled frame's guest
+   * frame still has the identity it was pushed with, its function's entry.
+   * Give it its compiled frame's (a caller's call site, the innermost
+   * frame's exit site) before the rebuild clears the record. Only a poll
+   * sets the innermost identity itself, and a named exit is not a poll:
+   * the interpreter resumes that instruction without polling it again. */
+  {
+    GRCORE_Stack *stack = grcore_context_stack(context);
+    const size_t frame_count = grcore_stack_frame_count(stack);
+    GRCORE_CompiledWalk walk;
+    GRCORE_CompiledFrame frame;
+    if (frame_count && grcore_compiled_walk_begin(context, &walk) == GRCORE_OK) {
+      GRCORE_FrameRef guest = grcore_stack_top(stack);
+      size_t guest_index = frame_count - 1u, record = 0;
+      int any = 0;
+      while (grcore_compiled_walk_next(&walk, &frame) == GRCORE_CWALK_FRAME) {
+        if (any && frame.record != record) break; /* not this rebuild's run */
+        any = 1;
+        record = frame.record;
+        const size_t index = frame.base_frames - 1u +
+            (frame.run_length - 1u - frame.run_depth);
+        while (guest_index > index) {
+          guest = grcore_stack_caller(stack, guest);
+          --guest_index;
+        }
+        if (index < frame_count)
+          (void)grcore_stack_set_identity(stack, guest, frame.identity);
+      }
+    }
+  }
   GRCORE_Result result = grcore_compiled_rebuild(context,
       reservation, keep, &rebuilt);
   if (result == GRCORE_OK) runtime->jit_deopt_cause = cause;
@@ -2797,9 +2828,15 @@ static void trap_poll(GRCORE_Context *context, void *value, GRCORE_PollCall *cal
     uint64_t fuel_limit=grcore_context_fuel_limit(context);
     uint64_t memory_limit=grcore_context_memory_bytes(context);
     uint64_t memory_used=grcore_context_memory_in_use(context);
-    if((fuel_limit!=UINT64_MAX&&
-        grcore_context_fuel_remaining(context)==0)||
-        (memory_limit!=UINT64_MAX&&memory_used>memory_limit)){
+    const int fuel_out=fuel_limit!=UINT64_MAX&&
+        grcore_context_fuel_remaining(context)==0;
+    /* The frame differential's stop: a resumable pause where the fuel ran
+     * out, which is the same instruction in both tiers. */
+    if(fuel_out&&r->store&&r->store->test_fuel_pauses){
+      (void)grcore_pollcall_vote(call,GRCORE_VERDICT_PAUSE);
+      return;
+    }
+    if(fuel_out||(memory_limit!=UINT64_MAX&&memory_used>memory_limit)){
       r->error=GLWASM_ERR_LIMIT;
       (void)grcore_pollcall_set_unwind_result(call,GRCORE_ERR_LIMIT);
       (void)grcore_pollcall_vote(call,GRCORE_VERDICT_UNWIND);
@@ -5986,6 +6023,12 @@ GLWASM_Result glwasm_runtime_pause_position(const GLWASM_Runtime*r,
   *function=(uint32_t)identity.function;*offset=identity.offset;return GLWASM_OK;
 }
 GLWASM_Result glwasm_runtime_request_test_pause(GLWASM_Runtime*r){if(!r||r->store->run.active)return GLWASM_ERR_INVALID;GRCORE_Port*port=NULL;if(grcore_context_port(r->store->context,&port)!=GRCORE_OK)return GLWASM_ERR_OOM;GRCORE_Result cr=grcore_port_post(port,GRCORE_REQUEST_INTERRUPT);grcore_port_release(port);return cr==GRCORE_OK?GLWASM_OK:GLWASM_ERR_INTERNAL;}
+GLWASM_Result glwasm_store_test_pause_on_fuel(GLWASM_Store *store,
+    int enabled) {
+  if (!store || store->run.active) return GLWASM_ERR_INVALID;
+  store->test_fuel_pauses = enabled ? 1u : 0u;
+  return GLWASM_OK;
+}
 GLWASM_Result glwasm_runtime_test_pause_after_bulk_chunks(
     GLWASM_Runtime *runtime, uint32_t chunks) {
   if (!runtime || runtime->store->run.active) return GLWASM_ERR_INVALID;

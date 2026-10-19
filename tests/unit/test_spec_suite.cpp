@@ -8,12 +8,22 @@
  * feature; nothing is left pending. The gate fails on any failure, on any
  * command the runner cannot execute, and on any JIT refusal or exit that is
  * not a named rule (tests/data-wast-jit-rules.tsv).
+ *
+ * The frame differential runs the same corpus again, with every invocation
+ * stopped once inside and its whole stack compared across tiers (FrameDiff).
  */
 #include <ghoti.io/lang-wasm/decode.h>
 #include <ghoti.io/lang-wasm/host.h>
 #include <ghoti.io/lang-wasm/parse.h>
 #include <ghoti.io/lang-wasm/policy.h>
 #include <ghoti.io/lang-wasm/script.h>
+#include <ghoti.io/runtime-debug/runtime-debug.h>
+#include <ghoti.io/runtime-heap/heap.h>
+#include <ghoti.io/runtime-heap/options.h>
+#ifdef GLWASM_SPEC_RELOCATE
+#include <ghoti.io/runtime-heap/relocate.h>
+#endif
+#include <ghoti.io/runtime-heap/roots.h>
 #include "module_internal.h"
 #include "runtime/runtime.h"
 #include "wast_values.h"
@@ -24,6 +34,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -447,16 +458,215 @@ struct InvokeOutcome {
   std::string detail;
 };
 
+/* The cross-tier frame differential's instrument for one store. Each
+ * invocation runs natively on a fuel allowance drawn from its position in
+ * the script, pauses where the allowance runs out (a test seam makes
+ * exhausted fuel pause rather than unwind), and is recorded there
+ * through the debugger: every frame's identity and scopes, and every
+ * memory. Both tiers draw the same allowances and charge the same fuel, so
+ * they stop at the same instruction, and the JIT tier's record is rebuilt
+ * from compiled frames. The store runs on a torture heap that is collected
+ * at every stop with a rooted probe that must survive (and move, when
+ * relocation is built in), on a stack that moves at every push. */
+class FrameDiff {
+ public:
+  explicit FrameDiff(uint64_t seed) : state_(seed) {}
+  FrameDiff(const FrameDiff &) = delete;
+  FrameDiff &operator=(const FrameDiff &) = delete;
+  ~FrameDiff() {
+    if (rooted_) (void)grheap_root_remove(heap_, &probe_);
+  }
+
+  bool attach(GLWASM_Store *store, std::string *why) {
+    store_ = store;
+    GRCORE_Context *context = glwasm_store_context(store);
+    GRHEAP_Options *options = nullptr;
+#ifdef GLWASM_SPEC_RELOCATE
+    /* The relocation build exists to require it. */
+    relocate_ = grheap_relocation_available();
+    if (!relocate_) { *why = "relocation is not available"; return false; }
+#endif
+    const bool heap_made = context &&
+        grheap_options_create(nullptr, &options) == GRHEAP_OK && options &&
+        grheap_options_set_torture(options, true) == GRHEAP_OK &&
+#ifdef GLWASM_SPEC_RELOCATE
+        (!relocate_ || grheap_options_set_relocate(options, true) ==
+            GRHEAP_OK) &&
+#endif
+        grheap_heap_create(context, options, &heap_) == GRHEAP_OK && heap_;
+    grheap_options_destroy(options);
+    if (!heap_made) { *why = "no torture heap"; return false; }
+    static const GRHEAP_Type probe_type = GRHEAP_TYPE_INIT(
+        "spec-suite-probe", sizeof(uint64_t), nullptr, nullptr, nullptr,
+        nullptr, nullptr);
+    if (grheap_alloc(heap_, &probe_type, &probe_) != GRHEAP_OK || !probe_) {
+      *why = "no probe";
+      return false;
+    }
+    *static_cast<uint64_t *>(probe_) = kProbe;
+    if (grheap_root_add(heap_, &probe_) != GRHEAP_OK) {
+      *why = "probe not rooted";
+      return false;
+    }
+    rooted_ = true;
+    stack_ = grcore_context_stack(context);
+    if (!stack_ || grcore_stack_set_always_move(stack_, true) != GRCORE_OK) {
+      *why = "stack cannot be made to move";
+      return false;
+    }
+    moves_before_ = grcore_stack_move_count(stack_);
+    if (grdbg_debugger_attach(context, nullptr, &debugger_) != GRDBG_OK ||
+        !debugger_) {
+      *why = "no debugger";
+      return false;
+    }
+    if (glwasm_store_test_pause_on_fuel(store, 1) != GLWASM_OK) {
+      *why = "fuel cannot pause";
+      return false;
+    }
+    return true;
+  }
+
+  /* Log-uniform up to 2^20, so short invocations stop near their start
+   * and long ones are also stopped deep inside. */
+  uint64_t next_allowance() {
+    const uint64_t r = next();
+    return 1u + (next() & ((UINT64_C(1) << (r % 21u)) - 1u));
+  }
+
+  /* At a fuel pause: collect, check the probe, and describe the stack. */
+  std::string record() {
+    ++stops_;
+    void *before = probe_;
+    if (grheap_collect(heap_) != GRHEAP_OK || !probe_ ||
+        *static_cast<uint64_t *>(probe_) != kProbe)
+      probe_failed_ = true;
+    if (probe_ != before) ++probe_moves_;
+    GRDBG_Stop stop{};
+    if (grdbg_debugger_stopped(debugger_, &stop) != GRDBG_OK)
+      return "<not stopped>";
+    size_t total = 0, available = 0;
+    if (grdbg_debugger_frames(debugger_, &total, &available) != GRDBG_OK)
+      return "<no frames>";
+    std::string out = "frames " + std::to_string(total) + "/" +
+        std::to_string(available);
+    for (size_t f = 0; f < available; ++f) {
+      GRDBG_FrameIdentity id = GRDBG_FRAME_IDENTITY_INIT;
+      if (grdbg_debugger_frame_identity(debugger_, f, &id) != GRDBG_OK)
+        return out + " <identity>";
+      /* A function identity's high half is its module's debug id, which
+       * each tier's decode allocates afresh; name the module by the order
+       * it first appears instead. */
+      const auto module = modules_.emplace(id.function >> 32,
+          modules_.size()).first->second;
+      out += " | m" + std::to_string(module) + ".f" +
+          std::to_string(id.function & UINT32_MAX) + "@" +
+          std::to_string(id.offset) + " " +
+          (id.function_name ? id.function_name : "");
+      size_t scopes = 0;
+      if (grdbg_debugger_scope_count(debugger_, f, &scopes) != GRDBG_OK)
+        return out + " <scopes>";
+      for (size_t sc = 0; sc < scopes; ++sc) {
+        GRDBG_Scope scope{};
+        if (grdbg_debugger_scope(debugger_, f, sc, &scope) != GRDBG_OK)
+          return out + " <scope>";
+        out += std::string(" [") + scope.name;
+        for (size_t v = 0; v < scope.variable_count; ++v) {
+          GRDBG_Variable variable{};
+          if (grdbg_debugger_variable(debugger_, f, sc, v, &variable) !=
+              GRDBG_OK)
+            return out + " <variable>";
+          out += std::string(" ") + variable.name + "=" + variable.text;
+        }
+        out += "]";
+      }
+    }
+    size_t memories = 0;
+    if (available &&
+        grdbg_debugger_memory_count(debugger_, 0, &memories) != GRDBG_OK)
+      return out + " <memories>";
+    for (size_t m = 0; m < memories; ++m) {
+      GRDBG_Memory memory{};
+      if (grdbg_debugger_memory(debugger_, 0, m, &memory) != GRDBG_OK)
+        return out + " <memory>";
+      /* The size, and a digest of the first MiB: every memory the corpus
+       * writes to is smaller. */
+      uint64_t digest = UINT64_C(0xcbf29ce484222325);
+      std::vector<uint8_t> chunk(65536);
+      const uint64_t limit = std::min<uint64_t>(memory.size_bytes, 1u << 20);
+      for (uint64_t at = 0; at < limit; at += chunk.size()) {
+        const size_t n = static_cast<size_t>(
+            std::min<uint64_t>(chunk.size(), limit - at));
+        if (grdbg_debugger_read_memory(debugger_, 0, m, at, chunk.data(), n) !=
+            GRDBG_OK)
+          return out + " <memory read>";
+        for (size_t i = 0; i < n; ++i)
+          digest = (digest ^ chunk[i]) * UINT64_C(0x100000001b3);
+      }
+      out += " | memory " + std::to_string(memory.size_bytes) + " " +
+          hex(digest);
+    }
+    return out;
+  }
+
+  GLWASM_Store *store() const { return store_; }
+  uint64_t stops() const { return stops_; }
+  /* Did the instruments hold: the probe survived every collection and,
+   * with relocation, moved; the stack moved. */
+  std::string verdict() const {
+    if (probe_failed_) return "the rooted probe did not survive a collection";
+    if (relocate_ && stops_ && !probe_moves_)
+      return "relocation never moved the rooted probe";
+    if (stops_ && grcore_stack_move_count(stack_) <= moves_before_)
+      return "the guest stack never moved";
+    return {};
+  }
+
+ private:
+  static constexpr uint64_t kProbe = UINT64_C(0x7370656373756974);
+  uint64_t next() { /* splitmix64 */
+    uint64_t z = (state_ += UINT64_C(0x9e3779b97f4a7c15));
+    z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return z ^ (z >> 31);
+  }
+  uint64_t state_;
+  GLWASM_Store *store_ = nullptr;
+  GRHEAP_Heap *heap_ = nullptr;
+  void *probe_ = nullptr;
+  bool rooted_ = false, relocate_ = false, probe_failed_ = false;
+  GRCORE_Stack *stack_ = nullptr;
+  uint64_t moves_before_ = 0, stops_ = 0, probe_moves_ = 0;
+  GRDBG_Debugger *debugger_ = nullptr;
+  std::map<uint64_t, size_t> modules_;
+};
+
 InvokeOutcome invoke(Instance &instance, uint32_t function,
-    const std::vector<uint64_t> &args) {
+    const std::vector<uint64_t> &args, FrameDiff *diff = nullptr,
+    std::string *stop = nullptr) {
   InvokeOutcome outcome;
   const GLWASM_TypeDef &type = instance.module->types[
       instance.module->funcs[function].type_index];
   outcome.results.assign(type.nresults, 0);
   uint32_t count = type.nresults;
-  const GLWASM_Result result = glwasm_runtime_invoke_results(instance.runtime,
+  if (diff) (void)glwasm_store_set_fuel(diff->store(), diff->next_allowance());
+  GLWASM_Result result = glwasm_runtime_invoke_results(instance.runtime,
       function, args.data(), static_cast<uint32_t>(args.size()),
       outcome.results.data(), &count);
+  if (diff) {
+    /* One stop per invocation: record it, lift the allowance, finish. */
+    *stop = "ran to the end";
+    if (result == GLWASM_ERR_PAUSED) {
+      *stop = diff->record();
+      (void)glwasm_store_set_fuel(diff->store(), UINT64_MAX);
+      int paused = 0;
+      count = type.nresults;
+      result = glwasm_runtime_resume_results(instance.runtime,
+          outcome.results.data(), &count, &paused);
+      if (result == GLWASM_OK && paused) result = GLWASM_ERR_PAUSED;
+    }
+    (void)glwasm_store_set_fuel(diff->store(), UINT64_MAX);
+  }
   if (result == GLWASM_OK) {
     if (count != type.nresults) {
       outcome.detail = "result count " + std::to_string(count);
@@ -512,6 +722,7 @@ GLWASM_Result spectest_print(const GLWASM_HostCall *, uint64_t *) {
 /* The JIT tier's account of one instance: what compiled, what was refused,
  * and which opcodes exited, checked against the named rules. */
 struct JitAccount {
+  uint64_t compiled_pauses = 0; /* differential stops inside compiled code */
   uint64_t functions_executed = 0;
   uint64_t functions_compiled = 0;
   uint64_t compiled_entries = 0;
@@ -766,13 +977,25 @@ class ScriptRun {
   ScriptRun(const std::string &relative, const std::string &source,
       const std::map<uint32_t, std::string> &line_skips, Tier tier,
       const JitRules &rules, JitAccount &jit,
-      std::vector<std::string> &failures)
+      std::vector<std::string> &failures,
+      std::vector<std::string> *stops = nullptr, uint64_t seed = 0)
       : relative_(relative), source_(source), line_skips_(line_skips),
-        tier_(tier), rules_(rules), jit_(jit), failures_(failures) {
+        tier_(tier), rules_(rules), jit_(jit), failures_(failures),
+        stops_(stops) {
     const GLWASM_Policy policy = suite_policy(tier);
     if (glwasm_store_create(&policy, &store_) != GLWASM_OK) {
       failures_.push_back(relative_ + ": could not create a store");
       return;
+    }
+    /* With a stop list, this is a frame-differential run. */
+    if (stops_) {
+      diff_ = std::make_unique<FrameDiff>(seed);
+      std::string why;
+      if (!diff_->attach(store_, &why)) {
+        failures_.push_back(relative_ + ": frame differential: " + why);
+        diff_.reset();
+        return;
+      }
     }
     /* spectest goes first, registered under its name. */
     static const GLWASM_HostValueType i32[] = {GLWASM_HOST_I32},
@@ -815,10 +1038,18 @@ class ScriptRun {
   ~ScriptRun() {
     for (auto &instance : instances_) finish_instance(*instance);
     instances_.clear();
+    if (diff_) {
+      const std::string verdict = diff_->verdict();
+      if (!verdict.empty())
+        failures_.push_back(relative_ + " (" + tier_name(tier_) + "): " +
+            verdict);
+      diff_.reset(); /* its root lives in the store's heap */
+    }
     glwasm_store_destroy(store_);
   }
 
   CommandResult run(const GLWASM_Command &command) {
+    line_ = command.location.line;
     const auto skip = line_skips_.find(command.location.line);
     if (skip != line_skips_.end()) {
       used_skips_.insert(command.location.line);
@@ -1010,6 +1241,17 @@ class ScriptRun {
     std::string skipped;
   };
 
+  /* Every invocation goes through here, so a differential run stops in
+   * each one and records where, by script line. */
+  InvokeOutcome call_invoke(const Call &call) {
+    if (!diff_) return invoke(*call.instance, call.function, call.args);
+    std::string stop;
+    InvokeOutcome outcome = invoke(*call.instance, call.function, call.args,
+        diff_.get(), &stop);
+    stops_->push_back(std::to_string(line_) + ": " + stop);
+    return outcome;
+  }
+
   bool prepare_call(const GLWASM_Text *action, Call *call, std::string *why) {
     if (!action || glwasm_text_kind(action) != GLWASM_TEXT_LIST ||
         !atom_is(semantic_child(action, 0), "invoke")) {
@@ -1059,7 +1301,7 @@ class ScriptRun {
     std::string why;
     if (!prepare_call(action, &call, &why)) return fail(why);
     if (!call.skipped.empty()) return {Verdict::Skip, call.skipped, {}};
-    const InvokeOutcome outcome = invoke(*call.instance, call.function, call.args);
+    const InvokeOutcome outcome = call_invoke(call);
     if (outcome.status != InvokeStatus::Returned)
       return fail("invoke did not return: " + describe(outcome));
     return {Verdict::Pass, {}, outcome.results};
@@ -1114,8 +1356,7 @@ class ScriptRun {
       Call call;
       if (!prepare_call(action, &call, &why)) return fail(why);
       if (!call.skipped.empty()) return {Verdict::Skip, call.skipped, {}};
-      const InvokeOutcome outcome = invoke(*call.instance, call.function,
-          call.args);
+      const InvokeOutcome outcome = call_invoke(call);
       if (outcome.status != InvokeStatus::Returned)
         return fail("expected a return, " + describe(outcome));
       actual = outcome.results;
@@ -1199,7 +1440,7 @@ class ScriptRun {
     std::string why;
     if (!prepare_call(action, &call, &why)) return fail(why);
     if (!call.skipped.empty()) return {Verdict::Skip, call.skipped, {}};
-    const InvokeOutcome outcome = invoke(*call.instance, call.function, call.args);
+    const InvokeOutcome outcome = call_invoke(call);
     if (outcome.status != InvokeStatus::Trapped)
       return fail("expected trap \"" + expected + "\", " + describe(outcome));
     if (!trap_matches(outcome.trap, expected))
@@ -1214,7 +1455,7 @@ class ScriptRun {
     if (!prepare_call(semantic_child(command.syntax, 1), &call, &why))
       return fail(why);
     if (!call.skipped.empty()) return {Verdict::Skip, call.skipped, {}};
-    const InvokeOutcome outcome = invoke(*call.instance, call.function, call.args);
+    const InvokeOutcome outcome = call_invoke(call);
     if (outcome.status != InvokeStatus::Exhausted)
       return fail("expected call stack exhaustion, " + describe(outcome));
     return pass();
@@ -1226,7 +1467,7 @@ class ScriptRun {
     if (!prepare_call(semantic_child(command.syntax, 1), &call, &why))
       return fail(why);
     if (!call.skipped.empty()) return {Verdict::Skip, call.skipped, {}};
-    const InvokeOutcome outcome = invoke(*call.instance, call.function, call.args);
+    const InvokeOutcome outcome = call_invoke(call);
     if (outcome.status != InvokeStatus::Exception)
       return fail("expected an uncaught exception, " + describe(outcome));
     return pass();
@@ -1291,6 +1532,18 @@ class ScriptRun {
 
   void finish_instance(Instance &instance) {
     if (tier_ != Tier::Jit || !instance.runtime) return;
+    /* A differential run's stops are pause exits; count those taken in
+     * compiled code, and leave the audit to the main run. */
+    if (diff_) {
+      for (uint32_t f = instance.module->nimported_funcs;
+           f < instance.module->nfuncs; ++f) {
+        GLWASM_JitCacheStats stats{};
+        if (glwasm_runtime_test_jit_stats(instance.runtime, f, &stats) ==
+            GLWASM_OK)
+          jit_.compiled_pauses += stats.exit_counts[GLWASM_JIT_EXIT_PAUSE];
+      }
+      return;
+    }
     const std::string where = relative_ + " (" + tier_name(tier_) + ")";
     audit_jit(instance, rules_, jit_, failures_, where);
     std::map<uint16_t, uint64_t> seen;
@@ -1304,6 +1557,9 @@ class ScriptRun {
   const JitRules &rules_;
   JitAccount &jit_;
   std::vector<std::string> &failures_;
+  std::vector<std::string> *stops_ = nullptr;
+  std::unique_ptr<FrameDiff> diff_;
+  uint32_t line_ = 0;
   GLWASM_Store *store_ = nullptr;
   std::vector<std::unique_ptr<Instance>> instances_;
   Slot current_;
@@ -1409,7 +1665,9 @@ TEST(WastValues, TrapMessagesMatchByPrefixOrAddedDetail) {
       "undefined element"));
 }
 
-TEST(SpecSuite, EveryInScopeCommandPassesInBothTiers) {
+/* Run the corpus in both tiers. With `differential`, every invocation is
+ * also stopped once and its stack compared across tiers (FrameDiff). */
+void run_suite(bool differential) {
   const fs::path root(env_or_fail("GLWASM_WAST_CORPUS_ROOT"));
   const auto classes = read_classifications(env_or_fail("GLWASM_WAST_CLASSIFICATION"));
   const auto skips = read_line_skips(env_or_fail("GLWASM_WAST_ASSERTION_SKIPS"));
@@ -1431,6 +1689,7 @@ TEST(SpecSuite, EveryInScopeCommandPassesInBothTiers) {
   size_t run_files = 0;
   const std::map<uint32_t, std::string> no_skips;
   std::set<std::pair<std::string, uint32_t>> used_skips;
+  uint64_t compared = 0, stopped = 0;
 
   for (const fs::path &path : files) {
     const std::string relative = "test/" + fs::relative(path, root).generic_string();
@@ -1462,11 +1721,15 @@ TEST(SpecSuite, EveryInScopeCommandPassesInBothTiers) {
     const auto &line_skips = file_skips == skips.end() ? no_skips
                                                        : file_skips->second;
     std::vector<std::vector<uint64_t>> interpreter_values;
+    std::map<Tier, std::vector<std::string>> stops;
+    /* Both tiers draw the same fuel allowances, from the file's name. */
+    const uint64_t seed = std::hash<std::string>{}(relative);
     for (Tier tier : {Tier::Interpreter, Tier::Jit}) {
       /* Name the file before it runs, so a crash names its file. */
       std::cout << "  running " << relative << " (" << tier_name(tier) << ")"
                 << std::endl;
-      ScriptRun run(relative, source, line_skips, tier, rules, jit, failures);
+      ScriptRun run(relative, source, line_skips, tier, rules, jit, failures,
+          differential ? &stops[tier] : nullptr, seed);
       for (size_t i = 0; i < glwasm_script_size(script); ++i) {
         GLWASM_Command command{};
         if (glwasm_script_at(script, i, &command) != GLWASM_OK) {
@@ -1516,6 +1779,23 @@ TEST(SpecSuite, EveryInScopeCommandPassesInBothTiers) {
       }
       for (uint32_t line : run.used_skips_) used_skips.emplace(relative, line);
     }
+    if (differential) {
+      const auto &a = stops[Tier::Interpreter], &b = stops[Tier::Jit];
+      if (a.size() != b.size())
+        failures.push_back(relative + ": " + std::to_string(a.size()) +
+            " interpreter stops against " + std::to_string(b.size()) +
+            " in the JIT tier");
+      auto clip = [](const std::string &text) {
+        return text.size() > 400 ? text.substr(0, 400) + "..." : text;
+      };
+      for (size_t k = 0; k < std::min(a.size(), b.size()); ++k) {
+        ++compared;
+        if (a[k].find(": ran to the end") == std::string::npos) ++stopped;
+        if (a[k] != b[k])
+          failures.push_back(relative + ":" + clip(a[k]) + "\n  jit: " +
+              clip(b[k]));
+      }
+    }
     glwasm_script_destroy(script);
   }
 
@@ -1526,7 +1806,12 @@ TEST(SpecSuite, EveryInScopeCommandPassesInBothTiers) {
         << "every line skip must name a command that exists";
   }
 
-  std::cout << "wg-3.0 spec suite: run-files=" << run_files << '\n';
+  std::cout << "wg-3.0 spec suite" << (differential ? " frame differential" : "")
+            << ": run-files=" << run_files << '\n';
+  if (differential)
+    std::cout << "  invocations compared=" << compared << " stopped="
+              << stopped << " jit stops in compiled code="
+              << jit.compiled_pauses << '\n';
   for (const auto &[reason, n] : skipped_files)
     std::cout << "  skipped file (" << reason << "): " << n << '\n';
   for (Tier tier : {Tier::Interpreter, Tier::Jit}) {
@@ -1552,11 +1837,27 @@ TEST(SpecSuite, EveryInScopeCommandPassesInBothTiers) {
   for (const auto &failure : failures) ADD_FAILURE() << failure;
   EXPECT_EQ(counts[Tier::Interpreter].passed, counts[Tier::Jit].passed)
       << "both tiers must pass the same commands";
-  EXPECT_GT(jit.compiled_returns, 0u);
+  if (differential) {
+    /* The instrument must have looked: invocations stopped, and stopped
+     * inside compiled code, or the comparison is the interpreter's with
+     * itself. The floors are well below the corpus's counts. */
+    if (!only) {
+      EXPECT_GT(stopped, 10000u);
+      EXPECT_GT(jit.compiled_pauses, 5000u);
+    }
+  } else {
+    EXPECT_GT(jit.compiled_returns, 0u);
+  }
   if (!only) {
     EXPECT_EQ(classes.size(), files.size())
         << "classification and fetched file sets must agree";
   }
+}
+
+TEST(SpecSuite, EveryInScopeCommandPassesInBothTiers) { run_suite(false); }
+
+TEST(SpecSuite, FramesMatchAcrossTiersWhereEveryInvocationStops) {
+  run_suite(true);
 }
 
 int main(int argc, char **argv) {

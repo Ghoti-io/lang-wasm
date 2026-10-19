@@ -399,6 +399,20 @@ test-debug-relocate: $(DEBUG_RELOCATE_APP) ## Compare compiled debugger frames u
 		[ "$$(printf '%s\n' "$$output" | grep -c '^\[==========\] 2 tests from .* ran\.')" -eq 1 ] && \
 		printf '%s\n' "$$output" | grep -q '^\[  PASSED  \] 2 tests\.' || exit 1
 
+SPEC_RELOCATE_OBJECT := $(OBJ_DIR)/tests/test_spec_suite_relocate.o
+SPEC_RELOCATE_APP := $(APP_DIR)/testSpec_suite_relocate$(EXE_EXTENSION)
+.PHONY: test-spec-relocate
+$(SPEC_RELOCATE_OBJECT): tests/unit/test_spec_suite.cpp $(FLAGS_STAMP) | check-debug-relocate-header $(LIBVER_GEN)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(TEST_INCLUDE) -DGLWASM_SPEC_RELOCATE -c $< -MMD -MP -MF $(@:.o=.d) -o $@
+$(SPEC_RELOCATE_APP): $(SPEC_RELOCATE_OBJECT) $(APP_DIR)/$(STATIC_TARGET) $(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(RHEAP_RELOCATE_LDFLAGS) $(LDFLAGS) $(TEST_LDFLAGS) $(TEST_WASMLIBRARY) $(TESTFLAGS)
+test-spec-relocate: $(SPEC_RELOCATE_APP) ## Run the spec-suite frame differential with relocation required
+	LD_LIBRARY_PATH="$(RHEAP_RELOCATE_LD_PATH)" $< \
+		--gtest_filter='SpecSuite.FramesMatchAcrossTiersWhereEveryInvocationStops' \
+		--gtest_brief=0 --gtest_color=no
+
 .PHONY: clean cloc docs docs-pdf coverage check-symbols check-stamps check-fp-contract check-aliasing check-labels check-edges check-wast-corpus check-install test-tsan test-gc-torture
 .PHONY: all install test test-quiet test-asan test-valgrind uninstall
 .PHONY: fuzz fuzz-clean fuzz-replay help

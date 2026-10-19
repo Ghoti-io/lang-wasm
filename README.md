@@ -246,7 +246,12 @@ environments.
 The explicit safety targets are `test`, `test-valgrind`, `test-asan`,
 `test-tsan`, `test-gc-torture`, `fuzz-replay`, `test-boundary-gc`,
 `test-boundary-relocate`, `test-debug-relocate`, `test-real-corpus`,
-`test-real-corpus-relocate`, and `check-install`. The optional measurement
+`test-real-corpus-relocate`, and `check-install`. Under `test-valgrind` the
+spec suite accepts eight `f32.convert_i64_s`/`_u` results one ulp off, the ones
+Valgrind's emulator rounds twice (through binary64), and only those: each must
+be exactly the double-rounded conversion of its argument, the count must be
+eight per tier, and the accommodation refuses to run outside Valgrind. Every
+other gate checks them exactly. The optional measurement
 targets are `benchmark-fixture-hashes`, `benchmark-metadata`, and
 `benchmark`; they are not dependencies of the ordinary build or test targets.
 The benchmark requires runtime-debug development files and explicit provenance

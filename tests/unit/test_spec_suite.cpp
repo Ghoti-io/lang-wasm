@@ -28,6 +28,12 @@
 #include "runtime/runtime.h"
 #include "wast_values.h"
 #include <gtest/gtest.h>
+#if defined(__linux__) && defined(__has_include)
+#if __has_include(<valgrind/valgrind.h>)
+#include <valgrind/valgrind.h>
+#define GLWASM_TEST_HAS_VALGRIND_CLIENT 1
+#endif
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -816,10 +822,42 @@ struct CommandResult {
   std::vector<uint64_t> values; /* plain invoke results, compared across tiers */
 };
 
+/* Valgrind's VEX converts an i64 to f32 through binary64, rounding twice, so
+ * a few spec conversions come out one ulp off under Memcheck in both tiers.
+ * test-valgrind asks for an accommodation by GLWASM_MEMCHECK_F32_I64_DOUBLE_ROUNDING=1,
+ * honoured only under a live Valgrind client: a result that is exactly the
+ * double-rounded conversion of the one i64 argument, where the script expects
+ * something else, is counted and not failed, and the count must be the
+ * corpus's (as runtime-jit's differential does for its one u64 input). */
+constexpr uint64_t kMemcheckDoubleRoundedCommands = 8;
+bool running_under_valgrind() {
+#if defined(GLWASM_TEST_HAS_VALGRIND_CLIENT)
+  return RUNNING_ON_VALGRIND != 0;
+#else
+  return false;
+#endif
+}
+bool memcheck_double_rounding_requested() {
+  const char *value = std::getenv("GLWASM_MEMCHECK_F32_I64_DOUBLE_ROUNDING");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+/* Whether `actual` is an i64 -> f32 conversion of `arg` rounded through
+ * binary64, signed or unsigned. */
+bool double_rounded_f32_of_i64(uint64_t arg, uint64_t actual) {
+  const float through_signed = static_cast<float>(
+      static_cast<double>(static_cast<int64_t>(arg)));
+  const float through_unsigned = static_cast<float>(static_cast<double>(arg));
+  uint32_t a = 0, b = 0;
+  std::memcpy(&a, &through_signed, sizeof a);
+  std::memcpy(&b, &through_unsigned, sizeof b);
+  return (uint32_t)actual == a || (uint32_t)actual == b;
+}
+
 struct Counts {
   std::map<std::string, uint64_t> passed;   /* by command kind */
   std::map<std::string, uint64_t> skipped;  /* by reason */
   uint64_t failed = 0;
+  uint64_t memcheck_double_rounded = 0;
 };
 
 const char *command_name(GLWASM_CommandKind kind) {
@@ -1094,6 +1132,10 @@ class ScriptRun {
   }
 
   std::set<uint32_t> used_skips_;
+  std::vector<uint64_t> call_args_;
+  uint32_t call_arg_types_ = 0;  /* how many of the arguments are i64 */
+  bool memcheck_double_rounding_ = false;
+  uint64_t memcheck_double_rounded_ = 0;
 
  private:
   static bool is_module_command(GLWASM_CommandKind kind) {
@@ -1359,6 +1401,10 @@ class ScriptRun {
       const InvokeOutcome outcome = call_invoke(call);
       if (outcome.status != InvokeStatus::Returned)
         return fail("expected a return, " + describe(outcome));
+      call_args_ = call.args;
+      call_arg_types_ = 0;
+      for (uint32_t k = 0; k < call.type->nparams; ++k)
+        if (call.type->params[k].kind == GLWASM_VK_I64) ++call_arg_types_;
       actual = outcome.results;
       types.assign(call.type->results, call.type->results + call.type->nresults);
     }
@@ -1400,6 +1446,14 @@ class ScriptRun {
       bool matched = false;
       for (const ExpectedValue &value : expected[i])
         matched = matched || value_matches(actual[i], types[i], value);
+      if (!matched && memcheck_double_rounding_ && actual.size() == 1 &&
+          types[0].kind == GLWASM_VK_F32 && call_args_.size() == 1 &&
+          call_arg_types_ == 1 && expected[0].size() == 1 &&
+          expected[0].front().bits != actual[0] &&
+          double_rounded_f32_of_i64(call_args_[0], actual[0])) {
+        ++memcheck_double_rounded_;
+        matched = true;
+      }
       if (!matched)
         return fail("result " + std::to_string(i) + " is " + hex(actual[i]) +
             ", expected " + hex(expected[i].front().bits));
@@ -1672,6 +1726,9 @@ void run_suite(bool differential) {
   const auto classes = read_classifications(env_or_fail("GLWASM_WAST_CLASSIFICATION"));
   const auto skips = read_line_skips(env_or_fail("GLWASM_WAST_ASSERTION_SKIPS"));
   const JitRules rules = read_jit_rules(env_or_fail("GLWASM_WAST_JIT_RULES"));
+  const bool memcheck = memcheck_double_rounding_requested();
+  ASSERT_FALSE(memcheck && !running_under_valgrind())
+      << "the Valgrind-only conversion accommodation needs a live Valgrind client";
   /* Run a subset while iterating: GLWASM_WAST_ONLY=<substring>. The gate
    * itself never sets it, and a filtered run cannot pass the totals below. */
   const char *only = std::getenv("GLWASM_WAST_ONLY");
@@ -1730,6 +1787,7 @@ void run_suite(bool differential) {
                 << std::endl;
       ScriptRun run(relative, source, line_skips, tier, rules, jit, failures,
           differential ? &stops[tier] : nullptr, seed);
+      run.memcheck_double_rounding_ = memcheck;
       for (size_t i = 0; i < glwasm_script_size(script); ++i) {
         GLWASM_Command command{};
         if (glwasm_script_at(script, i, &command) != GLWASM_OK) {
@@ -1778,6 +1836,7 @@ void run_suite(bool differential) {
         }
       }
       for (uint32_t line : run.used_skips_) used_skips.emplace(relative, line);
+      counts[tier].memcheck_double_rounded += run.memcheck_double_rounded_;
     }
     if (differential) {
       const auto &a = stops[Tier::Interpreter], &b = stops[Tier::Jit];
@@ -1834,6 +1893,20 @@ void run_suite(bool differential) {
   for (const auto &[rule, n] : jit.exits_by_rule)
     std::cout << "    exit (" << rule << ") " << n << '\n';
 
+  for (Tier tier : {Tier::Interpreter, Tier::Jit}) {
+    const uint64_t n = counts[tier].memcheck_double_rounded;
+    if (memcheck) {
+      std::cout << "  " << tier_name(tier) << ": accepted as Valgrind's "
+                   "double-rounded i64 -> f32 conversion: " << n << '\n';
+      if (!only) {
+        EXPECT_EQ(n, kMemcheckDoubleRoundedCommands)
+            << "the Valgrind accommodation must cover exactly the conversions "
+               "Valgrind rounds twice";
+      }
+    } else {
+      EXPECT_EQ(n, 0u);
+    }
+  }
   for (const auto &failure : failures) ADD_FAILURE() << failure;
   EXPECT_EQ(counts[Tier::Interpreter].passed, counts[Tier::Jit].passed)
       << "both tiers must pass the same commands";

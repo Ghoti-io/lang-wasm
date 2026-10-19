@@ -513,11 +513,14 @@ test-gc-torture: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES) ## Run t
 			tools/run-gtest-full.sh $$test_exe || exit 1; \
 	done
 
+# GLWASM_MEMCHECK_F32_I64_DOUBLE_ROUNDING: Valgrind rounds an i64 -> f32
+# conversion twice; testSpec_suite then accepts exactly the eight spec
+# conversions that come out double-rounded, and only under a live Valgrind.
 test-valgrind: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) ## Run the tests under Valgrind
 ifeq ($(OS_NAME), Linux)
 	@for test_exe in $(TEST_EXECUTABLES); do \
 		printf '\n### Valgrind %s ###\n\n' "$$(basename $$test_exe)"; \
-		LD_LIBRARY_PATH="$(TEST_LD_PATH)" tools/run-gtest-full.sh valgrind $(VALGRIND_FLAGS) $$test_exe || exit 1; \
+		GLWASM_MEMCHECK_F32_I64_DOUBLE_ROUNDING=1 LD_LIBRARY_PATH="$(TEST_LD_PATH)" tools/run-gtest-full.sh valgrind $(VALGRIND_FLAGS) $$test_exe || exit 1; \
 	done
 else
 	@printf 'Valgrind is only available on Linux\n' >&2; exit 1

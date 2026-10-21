@@ -6,7 +6,7 @@ source pin manifest. Upstream trees are fetched into the ignored build tree by
 identity before extracting anything. The test gate never fetches sources. Both
 commands use `GLWASM_REAL_CORPUS_BUILD_DIR` when set, defaulting to
 `build/real-corpus`; set it to writable scratch when the checkout is read-only.
-For EVO, export the scratch path, fetch the sources once, then generate
+On a host whose checkout is read-only, export the scratch path, fetch the sources once, then generate
 candidate pins:
 
 ```sh
@@ -108,7 +108,7 @@ same 74-byte result; the previous 49-byte golden had omitted the first row.
 
 `vectors.tsv` maps complete canonical output records, and `vectors.sha256` pins
 the manifest and each hex file. The expected values are derived from the fixed
-inputs and encoding specified by the drivers; EVO-X2 and Pi native and Wasmtime runs must
+inputs and encoding specified by the drivers; native x86-64 and arm64 runs, and Wasmtime runs, must
 confirm them before acceptance. Candidate files are written under the
 configured scratch directory. Do not replace vectors to make a failing engine
 pass; an oracle change requires reviewing the workload and source/toolchain

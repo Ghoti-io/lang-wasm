@@ -6,7 +6,7 @@ decodes and executes those same bytes for every sample. The in-tree converter
 source revision is covered by the source commit and source manifest; the
 runner also refuses to execute a fixture whose binary hash differs from
 `workloads/module-hashes.tsv`. The five pins were generated with
-`make benchmark-fixture-hashes` on EVO-X2 and the native Pi 4 arm64, and the
+`make benchmark-fixture-hashes` on a native x86-64 host and a native arm64 host, and the
 outputs and fixture/source hashes matched. Re-run that target when a workload
 or the lowering implementation changes; review cross-architecture agreement
 before collecting new measurements.
@@ -44,7 +44,7 @@ with make's verbose command output captured in `<raw.csv>.build.log`. It
 extracts the executed C compile, C++ compile, and link commands, fingerprints
 the compiler binaries actually invoked, identifies the host and fixture
 converter, derives effective flags from the captured commands, and generates
-the JSON environment manifest. Supply the current EVO image as the full
+the JSON environment manifest. Supply the current build image as the full
 `sha256:<64 hex digits>` digest. The command transcript
 and manifest are retained next to the raw CSV. The benchmark exits before
 sampling if the forced build fails or a required input/source identity is
@@ -63,7 +63,7 @@ omitted from both the recorder and the summarizer.
 The runner opens `GLWASM_BENCH_ENV_MANIFEST` at the supplied path, then records
 only its filename in raw rows. The recorder requires it in the same directory
 as `GLWASM_BENCH_OUTPUT`; the summary verifies that sibling file in the fetched
-result bundle. This permits an absolute EVO results path without embedding a
+result bundle. This permits an absolute results path on the build host without embedding a
 machine-specific path in each sample.
 
 The generated manifest includes compiler names, versions and binary hashes;
@@ -103,7 +103,7 @@ Example environment setup (record the values and command in the manifest):
 
 ```sh
 mkdir -p results
-export GLWASM_BENCH_RUN_ID=wasm-x2-20261016
+export GLWASM_BENCH_RUN_ID=wasm-x86-64-20261016
 export GLWASM_BENCH_SOURCE_COMMIT="$(git rev-parse HEAD)"
 export GLWASM_BENCH_SOURCE_MANIFEST_FILE=results/source-manifest.json
 export GLWASM_BENCH_SOURCE_MANIFEST_SHA256="$(python3 benchmarks/source_manifest.py \
@@ -183,4 +183,4 @@ Elapsed measurements are nanoseconds. Summaries report min, median,
 nearest-rank p95 (`sorted[ceil(0.95*n)-1]`), max, and median ns per work unit.
 First-call and poll-event distributions are reported separately from
 steady-state throughput. Raw CSV, stderr, and the exact environment-manifest
-file must be retained. Never combine X2 and Pi rows in one statistical group.
+file must be retained. Never combine x86-64 and arm64 rows in one statistical group.

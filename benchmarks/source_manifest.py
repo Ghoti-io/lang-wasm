@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-only
-"""Fingerprint the exact source trees used by an EVO benchmark snapshot."""
+"""Fingerprint the exact source trees used by a benchmark snapshot."""
 
 import argparse
 import hashlib

@@ -234,8 +234,8 @@ and C++ consumer that links and runs through the installed umbrella header.
 ## Compiler, runtime, and measurement status
 
 The release acceptance compiler is GCC 16.2.0 in the pinned
-`ghoti-build:gcc16` image. Native results are required from EVO-X2 x86-64 and
-Raspberry Pi 4 arm64. The architecture matrix also includes the documented
+`ghoti-build:gcc16` image. Native results are required from an x86-64 host and
+a Cortex-A72 arm64 host. The architecture matrix also includes the documented
 qemu arm64 and Wine Win64 gates, with baseline/no-optional-feature and
 supported-feature CPU masks where those gates apply. A compiler or runtime
 refusal must be recorded as a limitation; it is not a passing skip. Follow
@@ -258,8 +258,8 @@ The benchmark requires runtime-debug development files and explicit provenance
 inputs. See [the benchmark protocol](benchmarks/README.md) for setup, exact
 commands, raw artifact requirements, workload definitions, and summaries.
 
-As of 2026-10-18, the five canonical Wasm module hashes match between X2 and
-Pi. Native GCC 16 ordinary tests, GC torture, Valgrind, fuzz replay, and the
+As of 2026-10-18, the five canonical Wasm module hashes match between the x86-64 host and
+the arm64 host. Native GCC 16 ordinary tests, GC torture, Valgrind, fuzz replay, and the
 installed-consumer check passed on the committed implementation snapshot.
 Wine Win64 and qemu AArch64 gates passed on earlier implementation snapshots;
 their only subsequent executable-source differences are the Windows Tang test
@@ -268,17 +268,17 @@ corrected source-matched runtime-jit and Lang-Wasm ASan/UBSan and TSan gates
 passed. Tang's ordinary and GC-torture gates passed after its planted-control
 filter was narrowed to the tests that run under torture.
 The corrected pinned real-program corpus passed in ordinary and relocating
-heap modes on X2 and native Pi 4; the relocation arm ran all 18 cases with
+heap modes on the x86-64 host and the arm64 host; the relocation arm ran all 18 cases with
 matching native and Wasmtime vectors. The Story 13 measurement matrix records
 the exact gate snapshots, skips, and the earlier superseded checksum failure.
-The final-source Pi benchmark has 30 paired samples per tier and workload;
+The final-source arm64 benchmark has 30 paired samples per tier and workload;
 the four fully compiled workload medians favor JIT by 2.47x–14.33x.
 The mixed-boundary hybrid median favors its interpreter comparison by 2.20x.
-The quiet-host X2 benchmark used the same source manifest and 30 paired
+The quiet-host x86-64 benchmark used the same source manifest and 30 paired
 samples per tier and workload. Its median speedups were 16.19x for numeric
 loops, 3.65x for calls, 12.60x for linear memory, 3.63x for table/bulk, and
 2.47x for the hybrid mixed boundary. Attached-idle debugger medians were
-within 0.2% of the unattached interpreter medians on these X2 workloads.
+within 0.2% of the unattached interpreter medians on these x86-64 workloads.
 Interpret performance per workload and consult the retained raw data,
 provenance, first-call latency, and debugger polling distributions before
 drawing broader conclusions. The mixed-boundary

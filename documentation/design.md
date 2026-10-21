@@ -3,11 +3,11 @@
 **Status:** Stories 1–13 are implemented, measured, and accepted under the
 documented feature scope. The final independent documentation review passed.
 Story 11's pinned SQLite, zlib, and Lua corpus passed 12/12
-ordinary cases and 18/18 relocation cases on EVO-X2 and native Pi arm64,
+ordinary cases and 18/18 relocation cases on a native x86-64 host and a native arm64 host,
 including the exact 12/18-case corpus selection guard. Story 13 has completed
 cross-architecture gates, the corrected runtime-jit and Lang-Wasm sanitizer
-gates, Tang torture, and source-matched 30-sample native Pi and quiet-host
-EVO-X2 measurements. A final native Pi documentation-snapshot `make test`
+gates, Tang torture, and source-matched 30-sample native arm64 and quiet-host
+x86-64 measurements. A final native arm64 documentation-snapshot `make test`
 passed 273/273 with zero skips.
 Production Tang loader integration belongs to Tang Story 14, and the
 cross-heap handle table belongs to Tang's host-extensibility Story 13.
@@ -589,7 +589,7 @@ immutable upstream archives and verifies each archive checksum, then records
 and rechecks an extracted-tree digest. The gate itself never fetches. Changes
 to a source tree after extraction fail closed. Both scripts use
 `GLWASM_REAL_CORPUS_BUILD_DIR` when set, defaulting to `build/real-corpus`.
-On EVO, point it to writable scratch, fetch there before the offline gate, and
+On a host whose checkout is read-only, point it to writable scratch, fetch there before the offline gate, and
 keep that path for the candidate and full runs:
 
 ```sh
@@ -608,7 +608,7 @@ in-memory compression and round trip, and an embedded Lua 5.5.1 script. Each
 reports status and exposes its complete canonical output as bounded byte
 chunks. The vectors encode every selected SQLite row and column, all 4096 zlib
 round-trip bytes, and both Lua return values in wrapped hex files referenced by
-`vectors.tsv`. EVO-X2 and Pi must confirm them. `vectors.sha256` pins the TSV
+`vectors.tsv`. Native x86-64 and arm64 runs must confirm them. `vectors.sha256` pins the TSV
 and all output files. `licenses.tsv` pins the preserved upstream notices, and
 the test verifies those bytes against the fetched source trees. The upstream
 amalgamation and libraries remain unmodified; Ghoti-owned drivers sit beside
@@ -634,7 +634,7 @@ no imports. Lua has seven typed wasi-sdk libc imports; the test host resolves
 them only to callbacks that fail if invoked. The oracle's SQLite and zlib
 modules each use only the typed `fd_write` import for one-call bounded output.
 Module SHA-256 values are recorded in `module-hashes.tsv` after independent
-EVO-X2 and Pi builds have been reviewed, with separate rows for x86_64 and
+x86-64 and arm64 builds have been reviewed, with separate rows for x86_64 and
 aarch64. Both architectures must match the same semantic vectors; byte
 identity across distinct wasi-sdk distributions is not required.
 
@@ -644,11 +644,10 @@ vectors under the configured scratch directory, or `--all-tiers` to compare
 the independent results with pinned vectors. `make test-real-corpus` adds
 Lang-Wasm interpreter and JIT execution
 of each module. The final gate requires the pinned native image and toolchain
-on EVO-X2 and arm64; no timing result is treated as a correctness oracle.
+on x86-64 and arm64; no timing result is treated as a correctness oracle.
 
-On 2026-10-17, normal `--all-tiers` gates passed on EVO-X2
-(`xgates-lang-wasm-story11-final-x2-20261017-1402`) and the Pi
-(`xgates-lang-wasm-story11-final-pi-20261017-1402`). Both used the
+On 2026-10-17, normal `--all-tiers` gates passed on a native x86-64 host
+and a native arm64 host. Both used the
 `ghoti-build:gcc16` image, GCC 16.2.0, wasi-sdk 34.0 and Wasmtime 49.0.3;
 both verified the exact production import counts (0/0/7 for SQLite/zlib/Lua),
 oracle import counts (1/1/7), and native/Wasmtime byte equality for all three
@@ -759,7 +758,7 @@ debugger setup with steady-state execution are rejected.
 ### Compiler compatibility, limitations, and measured results
 
 The required native compiler is GCC 16.2.0 in the pinned `ghoti-build:gcc16`
-image. The release matrix calls for EVO-X2 x86-64 and Raspberry Pi 4 arm64,
+image. The release matrix calls for a native x86-64 host and a Cortex-A72 arm64 host,
 plus qemu arm64 and Wine Win64 gates from the suite's documented images. CPU
 feature masks must cover the baseline and supported feature sets where
 applicable. A refusal or unsupported gate is recorded against the architecture
@@ -767,9 +766,9 @@ contract rather than skipped. Benchmark setup, exact metadata, raw artifacts,
 and command lines are specified in `benchmarks/README.md`; the benchmark is
 opt-in and does not make the ordinary build network-dependent.
 
-As of 2026-10-18, the five exact Wasm fixture hashes agree between X2 and
-Pi source snapshots. The documented implementation snapshots passed ordinary
-suites on GCC 16 X2 and native Pi 4, the complete Wine Win64 and qemu AArch64
+As of 2026-10-18, the five exact Wasm fixture hashes agree between the x86-64 and
+arm64 source snapshots. The documented implementation snapshots passed ordinary
+suites on GCC 16 on the x86-64 host and natively on the arm64 host, the complete Wine Win64 and qemu AArch64
 cross gates, Valgrind, GC torture, fuzz replay, and installed-consumer checks.
 The matrix identifies each snapshot and its subsequent source differences.
 The corrected pinned real-program corpus passed on both machines in ordinary
@@ -779,17 +778,17 @@ source snapshots, image identities, named skips, gate ledgers, and retained
 logs; an earlier aggregate corpus failure caused by a stale Makefile checksum
 is recorded there and superseded by the corrected-source corpus jobs.
 
-The final-source Pi run contains 30 paired samples per tier and workload.
+The final-source arm64 run contains 30 paired samples per tier and workload.
 Its median interpreter to compiled speedups were 14.33x for numeric loops,
 2.47x for calls, 10.27x for linear memory, and 2.83x for table/bulk; the
 mixed-boundary hybrid was 2.20x faster than its interpreter comparison. The
 attached-idle debugger's median cost ranged by workload, including an
-observed 8.9% increase for calls. The quiet-host X2 run used the same source
+observed 8.9% increase for calls. The quiet-host x86-64 run used the same source
 manifest and 30 paired samples per tier and workload. Its median interpreter
 to compiled speedups were 16.19x for numeric loops, 3.65x for calls, 12.60x
 for linear memory, and 3.63x for table/bulk; the mixed-boundary hybrid was
 2.47x faster than its interpreter comparison. Attached-idle debugger medians
-were within 0.2% of unattached interpreter medians on these X2 workloads.
+were within 0.2% of unattached interpreter medians on these x86-64 workloads.
 Raw data, min/median/p95/max, first-call and poll-event measurements,
 commands, and provenance are retained in the measurement bundles cited by
 the matrix. The `mixed-boundary` tier is hybrid: the outer loop is compiled

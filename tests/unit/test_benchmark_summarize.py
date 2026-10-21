@@ -572,11 +572,11 @@ class SummarizerContractTests(unittest.TestCase):
 
     def test_build_recorder_prefers_human_readable_cpu_model(self):
         x86 = "processor : 0\nmodel : 112\nmodel name : Example Xeon\n"
-        arm = "processor : 0\nmodel : 4\nHardware : Raspberry Pi 4 Model B\n"
+        arm = "processor : 0\nmodel : 4\nHardware : Example Arm Board\n"
         self.assertEqual(record_build.model_name_from_cpuinfo(x86, "fallback"),
                          "Example Xeon")
         self.assertEqual(record_build.model_name_from_cpuinfo(arm, "fallback"),
-                         "Raspberry Pi 4 Model B")
+                         "Example Arm Board")
 
 
 if __name__ == "__main__":

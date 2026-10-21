@@ -207,14 +207,14 @@ The runnable sample host invokes `examples/runaway.wasm` under the untrusted
 policy and prints the pause location:
 
 ```bash
-make -C libs/lang-wasm sample PREFIX="$PWD/.local-lang-wasm"
+make -C libs/lang-wasm sample PREFIX=<prefix>
 ```
 
 ## Building
 
 ```bash
-export PKG_CONFIG_PATH="$PWD/.local/share/pkgconfig"
-make -C libs/lang-wasm test PREFIX="$PWD/.local-lang-wasm"
+export PKG_CONFIG_PATH="<prefix>/share/pkgconfig"
+make -C libs/lang-wasm test PREFIX=<prefix>
 ```
 
 Pass `PREFIX` on every make. pkg-config is how the library finds `cutil` and
@@ -225,7 +225,7 @@ Once installed, a program links with
 Verify the installed consumer path with:
 
 ```bash
-make -C libs/lang-wasm check-install PREFIX="$PWD/.local"
+make -C libs/lang-wasm check-install PREFIX=<prefix>
 ```
 
 This checks pkg-config metadata, installed include and library paths, and a C

@@ -1084,8 +1084,11 @@ static void wasm_jit_pop(void *opaque_context) {
     runtime->store->run.error = GLWASM_ERR_INTERNAL;
     return;
   }
+  /* The generated code also calls this for a callee that returned an exception
+   * through a site with no landing, before it passes the exception on. */
   jit_record_nested_exit(runtime, (uint32_t)frame_slots_ptr[H_FUNC],
-      GLWASM_JIT_EXIT_RETURN);
+      runtime->store->run.pending_exception ? GLWASM_JIT_EXIT_WASM_EXCEPTION
+                                            : GLWASM_JIT_EXIT_RETURN);
   if (!grcore_stack_frame_count(stack) ||
       grcore_stack_pop(stack) != GRCORE_OK) {
     runtime->store->run.error = GLWASM_ERR_INTERNAL;
